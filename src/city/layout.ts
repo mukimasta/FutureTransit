@@ -30,11 +30,21 @@ const integer = (world: World, min: number, max: number) =>
   min + Math.floor(random(world) * (max - min + 1));
 
 function buildingSize(world: World, kind: BuildingKind) {
-  if (kind === "office")
-    return { w: integer(world, 4, 7), h: integer(world, 3, 6) };
-  if (kind === "shop")
-    return { w: integer(world, 3, 6), h: integer(world, 3, 5) };
-  return { w: integer(world, 3, 6), h: integer(world, 3, 5) };
+  switch (kind) {
+    case "office":
+      return { w: integer(world, 4, 7), h: integer(world, 3, 6) };
+    case "school":
+      return { w: integer(world, 5, 7), h: integer(world, 4, 6) };
+    case "hospital":
+      return { w: integer(world, 5, 7), h: integer(world, 4, 6) };
+    case "park":
+      return { w: integer(world, 5, 8), h: integer(world, 4, 7) };
+    case "restaurant":
+      return { w: integer(world, 3, 5), h: integer(world, 3, 4) };
+    case "shop":
+    case "home":
+      return { w: integer(world, 3, 6), h: integer(world, 3, 5) };
+  }
 }
 
 function intersects(a: Rectangle, b: Rectangle, margin = 0): boolean {
@@ -131,12 +141,17 @@ export function clearDevelopmentSite(
   )
     return false;
 
-  return !world.residents.some(
-    (resident) =>
-      resident.journey?.walk &&
-      resident.journey.walk.end > world.time &&
-      resident.journey.walk.path.some((point) => pointInside(point, approach)),
-  );
+  // A booked passenger's final walk is already part of the door-to-door plan,
+  // even while the Pod is still driving. New buildings must not cover it.
+  return !world.residents.some((resident) => {
+    const journey = resident.journey;
+    return (
+      (journey?.walk &&
+        journey.walk.end > world.time &&
+        journey.walk.path.some((point) => pointInside(point, approach))) ||
+      journey?.egressPath?.some((point) => pointInside(point, approach))
+    );
+  });
 }
 
 function kindsForEvent(
@@ -145,13 +160,18 @@ function kindsForEvent(
 ): BuildingKind[] {
   if (event === "infill") {
     const phase = Math.floor(wave / 2) % 4;
-    return [["shop"], ["home"], ["office"], ["home", "shop"]][
-      phase
-    ]!.slice() as BuildingKind[];
+    return [
+      ["hospital", "park", "shop"],
+      ["restaurant", "home"],
+      ["school", "shop"],
+      ["home", "park", "restaurant"],
+    ][phase]!.slice() as BuildingKind[];
   }
-  if (wave % 6 === 4) return ["home", "home", "office", "shop"];
-  if (wave % 6 === 0) return ["office", "shop", "shop"];
-  return ["home", "office", "shop"];
+  if (wave === 0) return ["home", "office", "school", "restaurant"];
+  if (wave === 2) return ["home", "office", "hospital", "park"];
+  if (wave % 6 === 4) return ["home", "home", "office", "school", "shop"];
+  if (wave % 6 === 0) return ["office", "restaurant", "shop", "park"];
+  return ["home", "office", "shop", "hospital"];
 }
 
 function dimensionsForExpansion(world: World, wave: number) {

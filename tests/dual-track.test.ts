@@ -69,7 +69,7 @@ const resident = (id: string): Resident => ({
 
 function world(berths: Berth[], tracks: Track[], pods: Pod[]): World {
   return {
-    version: 1,
+    version: 2,
     seed: 1,
     rng: 1,
     time: 0,

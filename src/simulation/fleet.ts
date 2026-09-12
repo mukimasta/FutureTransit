@@ -24,8 +24,9 @@ export interface ParkingGroup {
   shortage: number;
 }
 
-/** Platforms are passenger interfaces, never fleet storage capacity. A network
- * keeps one unassigned parking slot in addition to one per Pod for circulation. */
+/** Platforms are passenger interfaces, never fleet storage capacity. One parking
+ * berth per Pod is sufficient: an atomic service plan may reserve its own
+ * vacated origin as its terminal. Extra parking improves positioning, not safety. */
 export function parkingGroups(world: World): ParkingGroup[] {
   const parents = new Map<string, string>();
   const root = (key: string): string => {
@@ -61,7 +62,7 @@ export function parkingGroups(world: World): ParkingGroup[] {
   }
   for (const group of groups.values())
     group.shortage = group.podIds.length
-      ? Math.max(0, group.podIds.length + 1 - group.parking)
+      ? Math.max(0, group.podIds.length - group.parking)
       : 0;
   return [...groups.values()];
 }
@@ -74,5 +75,5 @@ export function parkingEditAllowed(before: World, after: World): boolean {
 }
 export function parkingPurchaseShortage(world: World, berthId: string): number {
   const group = parkingGroups(world).find((g) => g.berthIds.includes(berthId));
-  return group ? Math.max(0, group.podIds.length + 2 - group.parking) : 1;
+  return group ? Math.max(0, group.podIds.length + 1 - group.parking) : 1;
 }

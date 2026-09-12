@@ -1,8 +1,11 @@
 import {
+  createContext,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -22,7 +25,7 @@ import type {
   ServicePlan,
   Track,
 } from "../shared/types";
-import type { MapViewProps } from "./types";
+import type { MapAction, MapViewProps } from "./types";
 import { separateLabels } from "./labels";
 import { residentFocusPoint } from "./focus";
 
@@ -37,6 +40,10 @@ const BUILDING_COLORS = {
   home: { fill: "#dce9dd", edge: "#86a88b" },
   office: { fill: "#dce8ef", edge: "#829fac" },
   shop: { fill: "#eadfcf", edge: "#ad9272" },
+  school: { fill: "#e4e1f0", edge: "#9790b5" },
+  hospital: { fill: "#e7eeee", edge: "#7f9fa0" },
+  restaurant: { fill: "#eee0d6", edge: "#bd927a" },
+  park: { fill: "#dce8d5", edge: "#8ea98a" },
 } as const;
 
 const clamp = (value: number, min: number, max: number) =>
@@ -47,6 +54,59 @@ const sameSelection = (
   id: string,
 ) => a?.kind === kind && a.id === id;
 const number = (value: number) => Number(value.toFixed(3));
+const MapUnitsContext = createContext(1);
+
+function MapActionButton({
+  point,
+  label,
+  title,
+  tone = "build",
+  minWidth = 62,
+  onAction,
+}: {
+  point: Point;
+  label: string;
+  title: string;
+  tone?: "build" | "parking" | "danger";
+  minWidth?: number;
+  onAction: () => void;
+}) {
+  const units = useContext(MapUnitsContext);
+  const width = Math.max(
+    minWidth,
+    22 +
+      [...label].reduce(
+        (sum, char) => sum + (/[^\x00-\x7f]/.test(char) ? 13 : 7),
+        0,
+      ),
+  );
+  return (
+    <g
+      className={`map-action ${tone}`}
+      data-map-action={title}
+      role="button"
+      tabIndex={0}
+      aria-label={title}
+      transform={`translate(${point.x} ${point.y}) scale(${units})`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onAction();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        event.stopPropagation();
+        onAction();
+      }}
+    >
+      <rect x={-width / 2} y="-18" width={width} height="36" rx="9" />
+      <text y="0" textAnchor="middle" dominantBaseline="central">
+        {label}
+      </text>
+      <title>{title}</title>
+    </g>
+  );
+}
 
 function baseView(width: number, height: number): ViewRect {
   return { x: -1.5, y: -1.5, width: width + 3, height: height + 3 };
@@ -194,6 +254,12 @@ export function MapView({
   tool,
   draft,
   onMapPoint,
+  onEmptyPoint,
+  context,
+  placing,
+  placement,
+  onPlacePoint,
+  onMapAction,
   onHoverPoint,
   candidateDraft,
   candidateInvalid,
@@ -221,6 +287,12 @@ export function MapView({
   const [view, setView] = useState<ViewRect>(base);
   const previousBase = useRef(base);
   const [svgWidth, setSvgWidth] = useState(800);
+  const [svgHeight, setSvgHeight] = useState(600);
+  const layingTrack = tool === "edit" && draft.length > 0;
+  const mapUnits = Math.max(
+    view.width / Math.max(1, svgWidth),
+    view.height / Math.max(1, svgHeight),
+  );
   const indoors = useMemo(() => {
     const counts = new Map<string, number>();
     for (const resident of world.residents)
@@ -234,9 +306,11 @@ export function MapView({
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg) return;
-    const observer = new ResizeObserver(() =>
-      setSvgWidth(svg.getBoundingClientRect().width),
-    );
+    const observer = new ResizeObserver(() => {
+      const bounds = svg.getBoundingClientRect();
+      setSvgWidth(bounds.width);
+      setSvgHeight(bounds.height);
+    });
     observer.observe(svg);
     return () => observer.disconnect();
   }, []);
@@ -381,22 +455,66 @@ export function MapView({
     mapPoint?: Point,
   ) => {
     event.stopPropagation();
-    if (tool === "track") {
+    if (ignoreClick.current) {
+      ignoreClick.current = false;
+      return;
+    }
+    if (placing) {
+      const point = snappedPoint(event);
+      if (point) onPlacePoint(point);
+      return;
+    }
+    if (layingTrack) {
       const point = mapPoint ?? snappedPoint(event);
       if (point) onMapPoint(point);
       return;
     }
-    onSelect(next, {
-      additive: event.metaKey || event.ctrlKey,
-      range: event.shiftKey,
-      single: event.altKey,
-    });
+    onSelect(
+      next,
+      {
+        additive: event.metaKey || event.ctrlKey,
+        range: event.shiftKey,
+        single: event.altKey,
+      },
+      mapPoint ?? snappedPoint(event) ?? undefined,
+    );
+  };
+
+  const selectEntityByKeyboard = (
+    event: ReactKeyboardEvent<SVGGElement>,
+    next: NonNullable<Selection>,
+    mapPoint?: Point,
+  ) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (placing) return;
+    if (layingTrack) {
+      if (draft.length > 1 && event.key === "Enter") {
+        onFinishDraft();
+        return;
+      }
+      if (mapPoint) onMapPoint(mapPoint);
+      return;
+    }
+    onSelect(
+      next,
+      {
+        additive: event.metaKey || event.ctrlKey,
+        range: event.shiftKey,
+        single: event.altKey,
+      },
+      mapPoint,
+    );
   };
 
   const onPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (
       event.button !== 0 ||
-      (event.target as Element).closest("[data-map-entity]")
+      (tool === "edit" &&
+        (event.target as Element).closest(
+          "[data-map-entity], [data-map-action]",
+        ))
     )
       return;
     drag.current = {
@@ -405,11 +523,16 @@ export function MapView({
       view,
       moved: false,
     };
-    event.currentTarget.setPointerCapture(event.pointerId);
+    // In view mode, a short click still reaches the facility. Capture only
+    // once it becomes a drag, otherwise the SVG would swallow selection.
+    if (!(event.target as Element).closest("[data-map-entity]"))
+      event.currentTarget.setPointerCapture(event.pointerId);
   };
 
   const onPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
-    if (tool === "track" && !drag.current?.moved) {
+    if (placing && !drag.current?.moved) {
+      onHoverPoint(snappedPoint(event));
+    } else if (layingTrack && !drag.current?.moved) {
       const berthId = (event.target as Element)
         .closest("[data-berth-id]")
         ?.getAttribute("data-berth-id");
@@ -423,6 +546,8 @@ export function MapView({
     const dy = event.clientY - drag.current.clientY;
     if (Math.hypot(dx, dy) < 3 && !drag.current.moved) return;
     drag.current.moved = true;
+    if (!event.currentTarget.hasPointerCapture(event.pointerId))
+      event.currentTarget.setPointerCapture(event.pointerId);
     followSuspended.current = true;
     const bounds = event.currentTarget.getBoundingClientRect();
     const scale = Math.max(
@@ -454,11 +579,21 @@ export function MapView({
       ignoreClick.current = false;
       return;
     }
-    if (tool === "track") {
+    if (tool === "view") {
+      onSelect(null);
+      return;
+    }
+    if (placing) {
+      const point = snappedPoint(event);
+      if (point) onPlacePoint(point);
+      return;
+    }
+    if (layingTrack) {
       const point = snappedPoint(event);
       if (point) onMapPoint(point);
     } else {
-      onSelect(null);
+      const point = snappedPoint(event);
+      if (point) onEmptyPoint(point);
     }
   };
 
@@ -567,10 +702,39 @@ export function MapView({
       )
       .map((edit) => edit.id),
   );
+  const selectedBuilding =
+    selection?.kind === "building"
+      ? world.buildings.find((item) => item.id === selection.id)
+      : undefined;
+  const selectedBerth =
+    selection?.kind === "berth"
+      ? world.berths.find((item) => item.id === selection.id)
+      : undefined;
+  const selectedParkingPod =
+    selectedBerth?.kind === "parking"
+      ? world.pods.find((pod) => pod.berthId === selectedBerth.id)
+      : undefined;
+  // Keep all three actions together, at a constant screen size and inside the map.
+  const menuPoint = {
+    x: clamp(
+      context?.point.x ?? 0,
+      view.x + 140 * mapUnits,
+      view.x + view.width - 140 * mapUnits,
+    ),
+    y: clamp(
+      (selectedBuilding
+        ? buildingRect(selectedBuilding).y
+        : (context?.point.y ?? 0)) -
+        52 * mapUnits,
+      view.y + 24 * mapUnits,
+      view.y + view.height - 70 * mapUnits,
+    ),
+  };
 
   return (
     <svg
       ref={svgRef}
+      data-map-mode={tool}
       data-testid="city-map"
       aria-label={
         language === "zh" ? "未来交通城市地图" : "Future Transit city map"
@@ -587,7 +751,7 @@ export function MapView({
         minHeight: 360,
         background: "#f5f4ef",
         touchAction: "none",
-        cursor: tool === "track" ? "crosshair" : "grab",
+        cursor: layingTrack || placing ? "crosshair" : "grab",
         userSelect: "none",
       }}
       onClick={onCanvasClick}
@@ -640,7 +804,7 @@ export function MapView({
         height={world.height + 8}
         fill="#f5f4ef"
       />
-      {tool === "track" && (
+      {tool === "edit" && (
         <rect
           x={0}
           y={0}
@@ -736,7 +900,7 @@ export function MapView({
             aria-label={`${language === "zh" ? "轨道" : "Track"} ${track.id} · ${track.lanes ?? 1} ${language === "zh" ? "车道 · 双向共享" : "shared lanes"}`}
             opacity={pendingTrackIds.has(track.id) ? 0.5 : 1}
             style={{
-              cursor: tool === "track" ? "crosshair" : "pointer",
+              cursor: layingTrack ? "crosshair" : "pointer",
               outline: "none",
               WebkitTapHighlightColor: "transparent",
             }}
@@ -744,17 +908,11 @@ export function MapView({
               selectEntity(event, { kind: "track", id: track.id })
             }
             onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                onSelect(
-                  { kind: "track", id: track.id },
-                  {
-                    additive: event.metaKey || event.ctrlKey,
-                    range: event.shiftKey,
-                    single: event.altKey,
-                  },
-                );
-              }
+              selectEntityByKeyboard(
+                event,
+                { kind: "track", id: track.id },
+                track.a,
+              );
             }}
           >
             <rect
@@ -938,10 +1096,17 @@ export function MapView({
               data-building-role={development?.role}
               data-tracked-resident={trackedResident?.id}
               role="button"
+              tabIndex={0}
               aria-label={`${language === "zh" ? building.name : building.nameEn}, ${count}`}
-              style={{ cursor: tool === "track" ? "crosshair" : "pointer" }}
+              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
               onClick={(event) =>
                 selectEntity(event, { kind: "building", id: building.id })
+              }
+              onKeyDown={(event) =>
+                selectEntityByKeyboard(event, {
+                  kind: "building",
+                  id: building.id,
+                })
               }
             >
               {(selected || focused) && (
@@ -958,14 +1123,36 @@ export function MapView({
                   opacity={selected ? 1 : 0.65}
                 />
               )}
-              <rect
-                {...rect}
-                rx="0.42"
-                fill={colors.fill}
-                stroke={colors.edge}
-                strokeWidth="0.11"
-                filter="url(#map-soft-shadow)"
-              />
+              {building.kind === "park" ? (
+                <g filter="url(#map-soft-shadow)" pointerEvents="none">
+                  <rect
+                    {...rect}
+                    rx="1.05"
+                    fill={colors.fill}
+                    stroke={colors.edge}
+                    strokeWidth="0.11"
+                  />
+                  {[-0.48, 0, 0.48].map((offset) => (
+                    <circle
+                      key={offset}
+                      cx={centerX + offset}
+                      cy={centerY - 0.18 + (offset === 0 ? 0.16 : 0)}
+                      r="0.2"
+                      fill="#a9c49e"
+                      opacity="0.78"
+                    />
+                  ))}
+                </g>
+              ) : (
+                <rect
+                  {...rect}
+                  rx="0.42"
+                  fill={colors.fill}
+                  stroke={colors.edge}
+                  strokeWidth="0.11"
+                  filter="url(#map-soft-shadow)"
+                />
+              )}
               {trackedResident && (
                 <text
                   x={centerX}
@@ -1065,14 +1252,22 @@ export function MapView({
               data-map-entity="berth"
               data-berth-id={berth.id}
               role="button"
+              tabIndex={0}
               aria-label={
                 language === "zh"
                   ? `${berth.kind === "platform" ? "站台" : "停车位"} ${berth.id}`
                   : `${berth.kind} ${berth.id}`
               }
-              style={{ cursor: tool === "track" ? "crosshair" : "pointer" }}
+              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
               onClick={(event) =>
                 selectEntity(
+                  event,
+                  { kind: "berth", id: berth.id },
+                  berth.access,
+                )
+              }
+              onKeyDown={(event) =>
+                selectEntityByKeyboard(
                   event,
                   { kind: "berth", id: berth.id },
                   berth.access,
@@ -1157,7 +1352,7 @@ export function MapView({
         </g>
       )}
 
-      {tool === "track" && candidatePath.length > 1 && (
+      {layingTrack && candidatePath.length > 1 && (
         <g
           pointerEvents="none"
           data-track-preview="true"
@@ -1200,10 +1395,17 @@ export function MapView({
               data-map-entity="resident"
               data-resident-id={resident.id}
               role="button"
+              tabIndex={0}
               aria-label={resident.name}
-              style={{ cursor: tool === "track" ? "crosshair" : "pointer" }}
+              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
               onClick={(event) =>
                 selectEntity(event, { kind: "resident", id: resident.id })
+              }
+              onKeyDown={(event) =>
+                selectEntityByKeyboard(event, {
+                  kind: "resident",
+                  id: resident.id,
+                })
               }
             >
               {(selected || focused) && (
@@ -1247,11 +1449,15 @@ export function MapView({
               data-map-entity="pod"
               data-pod-id={pod.id}
               role="button"
+              tabIndex={0}
               aria-label={`Pod ${pod.id}`}
               transform={`translate(${number(position.x)} ${number(position.y)})`}
-              style={{ cursor: tool === "track" ? "crosshair" : "pointer" }}
+              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
               onClick={(event) =>
                 selectEntity(event, { kind: "pod", id: pod.id })
+              }
+              onKeyDown={(event) =>
+                selectEntityByKeyboard(event, { kind: "pod", id: pod.id })
               }
             >
               {(selected || focused) && (
@@ -1292,6 +1498,156 @@ export function MapView({
           );
         })}
       </g>
+
+      {tool === "edit" && placing && placement && (
+        <g
+          pointerEvents="none"
+          data-berth-preview={placement.kind}
+          data-placement-valid={placement.valid}
+          stroke={placement.valid ? "#2f8270" : "#b9574e"}
+          fill="#fffdf8"
+          strokeWidth="0.12"
+        >
+          <line
+            x1={placement.point.x}
+            y1={placement.point.y}
+            x2={placement.access.x}
+            y2={placement.access.y}
+            strokeWidth="0.16"
+            strokeDasharray="0.16 0.1"
+          />
+          {placement.kind === "parking" ? (
+            <rect
+              x={placement.point.x - 0.32}
+              y={placement.point.y - 0.32}
+              width="0.64"
+              height="0.64"
+              rx="0.06"
+            />
+          ) : (
+            <circle cx={placement.point.x} cy={placement.point.y} r="0.32" />
+          )}
+          <circle
+            cx={placement.access.x}
+            cy={placement.access.y}
+            r="0.12"
+            fill={placement.valid ? "#2f8270" : "#b9574e"}
+          />
+        </g>
+      )}
+      {tool === "edit" && context && !placing && draft.length === 0 && (
+        <MapUnitsContext.Provider value={mapUnits}>
+          <g
+            className="map-actions"
+            aria-label={language === "zh" ? "地图操作" : "Map actions"}
+          >
+            <circle
+              cx={context.point.x}
+              cy={context.point.y}
+              r="0.22"
+              fill="#fffdf8"
+              stroke="#2f8270"
+              strokeWidth="0.08"
+              pointerEvents="none"
+            />
+            <MapActionButton
+              point={{ x: menuPoint.x - 92 * mapUnits, y: menuPoint.y }}
+              minWidth={84}
+              label={language === "zh" ? "铺轨" : "Track"}
+              title={language === "zh" ? "从此处铺轨" : "Start track here"}
+              onAction={() =>
+                onMapAction({ type: "choose-build", kind: "track" })
+              }
+            />
+            <MapActionButton
+              point={menuPoint}
+              minWidth={84}
+              label={language === "zh" ? "停车位" : "Parking"}
+              title={
+                language === "zh" ? "在此处建停车位" : "Build parking here"
+              }
+              tone="parking"
+              onAction={() =>
+                onMapAction({ type: "choose-build", kind: "parking" })
+              }
+            />
+            <MapActionButton
+              point={{ x: menuPoint.x + 92 * mapUnits, y: menuPoint.y }}
+              minWidth={84}
+              label={language === "zh" ? "站点" : "Station"}
+              title={language === "zh" ? "在此处建站点" : "Build station here"}
+              onAction={() =>
+                onMapAction({ type: "choose-build", kind: "platform" })
+              }
+            />
+            {selectedBerth?.kind === "platform" && (
+              <MapActionButton
+                point={{ x: menuPoint.x, y: menuPoint.y + 44 * mapUnits }}
+                label={language === "zh" ? "移除" : "Remove"}
+                title={language === "zh" ? "移除平台" : "Remove platform"}
+                tone="danger"
+                onAction={() =>
+                  onMapAction({ type: "remove-berth", id: selectedBerth.id })
+                }
+              />
+            )}
+            {selectedBerth?.kind === "parking" && (
+              <>
+                {!selectedParkingPod?.plan && (
+                  <MapActionButton
+                    point={{
+                      x: menuPoint.x - 46 * mapUnits,
+                      y: menuPoint.y + 44 * mapUnits,
+                    }}
+                    minWidth={84}
+                    label={
+                      selectedParkingPod
+                        ? language === "zh"
+                          ? "售 Pod"
+                          : "Sell Pod"
+                        : "+Pod"
+                    }
+                    title={
+                      selectedParkingPod
+                        ? language === "zh"
+                          ? "回售停放的 Pod"
+                          : "Sell parked Pod"
+                        : language === "zh"
+                          ? "购买 Pod"
+                          : "Buy Pod"
+                    }
+                    tone="parking"
+                    onAction={() =>
+                      selectedParkingPod
+                        ? onMapAction({
+                            type: "sell-pod",
+                            id: selectedParkingPod.id,
+                          })
+                        : onMapAction({
+                            type: "buy-pod",
+                            berthId: selectedBerth.id,
+                          })
+                    }
+                  />
+                )}
+                <MapActionButton
+                  point={{
+                    x: menuPoint.x + 46 * mapUnits,
+                    y: menuPoint.y + 44 * mapUnits,
+                  }}
+                  minWidth={84}
+                  label={language === "zh" ? "移除" : "Remove"}
+                  title={language === "zh" ? "移除停车位" : "Remove parking"}
+                  tone="danger"
+                  onAction={() =>
+                    onMapAction({ type: "remove-berth", id: selectedBerth.id })
+                  }
+                />
+              </>
+            )}
+          </g>
+        </MapUnitsContext.Provider>
+      )}
       {flows && (
         <g pointerEvents="none">
           {flowLabels.map(

@@ -128,7 +128,7 @@ function pod(id: string, berthId: string): Pod {
 
 function schedulerWorld(berths: Berth[], tracks: Track[], pods: Pod[]): World {
   return {
-    version: 1,
+    version: 2,
     seed: 1,
     rng: 1,
     time: 0,
@@ -448,7 +448,13 @@ describe("adversarial physical scheduling", () => {
     expect(sawPassengerService).toBe(true);
     expect(world.metrics.served).toBe(1);
     expect(world.residents[0].atBuildingId).toBe("b-office");
-    expect(world.pods[0].berthId).toBeTruthy();
+    // Delivery finishes before the empty return to its reserved parking berth.
+    expect(world.pods[0].plan?.finalBerthId ?? world.pods[0].berthId).toBe(
+      parking.id,
+    );
+    const returnEnd = world.pods[0].plan?.end ?? world.time;
+    stepWorld(world, Math.max(0, Math.ceil(returnEnd - world.time)));
+    expect(world.pods[0].berthId).toBe(parking.id);
     expect(world.berths.some((candidate) => candidate.id === parking.id)).toBe(
       true,
     );

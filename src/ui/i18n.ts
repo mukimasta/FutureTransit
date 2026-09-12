@@ -22,6 +22,10 @@ export const kindName = (kind: BuildingKind, language: Language) =>
     home: text(language, "住宅", "Home"),
     office: text(language, "办公", "Office"),
     shop: text(language, "商店", "Shop"),
+    school: text(language, "学校", "School"),
+    hospital: text(language, "医院", "Hospital"),
+    restaurant: text(language, "餐厅", "Restaurant"),
+    park: text(language, "公园", "Park"),
   })[kind];
 
 export const purposeName = (purpose: Purpose, language: Language) =>
@@ -30,6 +34,10 @@ export const purposeName = (purpose: Purpose, language: Language) =>
     shop: text(language, "购物", "Shop"),
     visit: text(language, "拜访", "Visit"),
     home: text(language, "回家", "Home"),
+    study: text(language, "上学", "Study"),
+    care: text(language, "就医", "Care"),
+    meal: text(language, "用餐", "Meal"),
+    leisure: text(language, "休闲", "Leisure"),
   })[purpose];
 
 export const statusName = (status: string, language: Language) =>

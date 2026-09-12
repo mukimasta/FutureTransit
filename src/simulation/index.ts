@@ -15,7 +15,6 @@ import {
   ALIGHT_SECONDS,
   BOARD_SECONDS,
   CELL_METERS,
-  GRANT_INTERVAL,
   MAX_PODS,
   PARKING_COST,
   PLATFORM_COST,
@@ -35,11 +34,20 @@ import {
   trackResources,
   validateTrackDraft,
 } from "../network";
+import { createResidents, planNextActivity } from "../population";
+import { decideTravel } from "../population/choice";
 import {
-  chooseTravelMode,
-  createResidents,
-  planNextActivity,
-} from "../population";
+  accruePodMovement,
+  book,
+  createEconomy,
+  fareForDistance,
+  fareRate,
+  loadedDistanceKm,
+  money,
+  repayLoan,
+  takeLoan,
+} from "../economy";
+import { MIN_FARE_PER_KM, MAX_FARE_PER_KM } from "../economy/config";
 import {
   commitPlan,
   planRelocation,
@@ -134,9 +142,110 @@ export function berthPlacement(
   return null;
 }
 
+const sideOffsets: Record<Side, Point> = {
+  north: { x: 0, y: -1 },
+  east: { x: 1, y: 0 },
+  south: { x: 0, y: 1 },
+  west: { x: -1, y: 0 },
+};
+
+function freeBerth(world: World, point: Point, access: Point): boolean {
+  return (
+    [point, access].every(
+      (p) =>
+        Number.isInteger(p.x) &&
+        Number.isInteger(p.y) &&
+        p.x >= 1 &&
+        p.y >= 1 &&
+        p.x < world.width - 1 &&
+        p.y < world.height - 1 &&
+        !isBlocked(world, p),
+    ) &&
+    !world.berths.some(
+      (b) =>
+        samePoint(b.point, point) ||
+        samePoint(b.point, access) ||
+        samePoint(b.access, point),
+    ) &&
+    !world.tracks.some((t) => samePoint(t.a, point) || samePoint(t.b, point))
+  );
+}
+
+export function canPlaceBerth(world: World, point: Point, side: Side): boolean {
+  const offset = sideOffsets[side];
+  return (
+    !!offset &&
+    freeBerth(world, point, { x: point.x + offset.x, y: point.y + offset.y })
+  );
+}
+
+/** Convenience placement near a platform, with separately priced connecting
+ * track. The completed parking bay has no station or building owner. */
+export function parkingPlacement(world: World, platform: Berth, side: Side) {
+  if (platform.kind !== "platform" || !sideOffsets[side]) return null;
+  const outward = sideOffsets[side];
+  const candidates: Point[] = [];
+  for (let radius = 1; radius <= 6; radius++)
+    for (let offset = -(radius - 1); offset <= radius - 1; offset++)
+      candidates.push({
+        x: platform.access.x + outward.x * radius - outward.y * offset,
+        y: platform.access.y + outward.y * radius + outward.x * offset,
+      });
+  for (const point of candidates) {
+    const access = { x: point.x - outward.x, y: point.y - outward.y };
+    if (!freeBerth(world, point, access)) continue;
+    // Cardinal BFS stays within the station yard and cannot pass through a bay.
+    const queue: Point[][] = [[access]];
+    const seen = new Set([pointKey(access)]);
+    let path: Point[] | undefined;
+    for (let i = 0; i < queue.length && !path; i++) {
+      const route = queue[i],
+        last = route.at(-1)!;
+      if (samePoint(last, platform.access)) {
+        path = route;
+        break;
+      }
+      for (const delta of Object.values(sideOffsets)) {
+        const next = { x: last.x + delta.x, y: last.y + delta.y };
+        if (
+          seen.has(pointKey(next)) ||
+          distance(next, platform.access) > 8 ||
+          next.x < 1 ||
+          next.y < 1 ||
+          next.x >= world.width - 1 ||
+          next.y >= world.height - 1 ||
+          isBlocked(world, next) ||
+          samePoint(next, point) ||
+          world.berths.some((b) => samePoint(b.point, next))
+        )
+          continue;
+        seen.add(pointKey(next));
+        queue.push([...route, next]);
+      }
+    }
+    if (!path) continue;
+    const draft =
+      path.length === 1
+        ? { edges: [], cost: 0, error: undefined }
+        : validateTrackDraft(world, path);
+    if (draft.error) continue;
+    return {
+      berth: {
+        kind: "parking" as const,
+        point,
+        access,
+        side,
+      },
+      tracks: draft.edges,
+      trackCost: draft.cost,
+    };
+  }
+  return null;
+}
+
 export function createWorld(seed = 7): World {
   const world: World = {
-    version: 1,
+    version: 2,
     seed,
     rng: seed >>> 0 || 7,
     time: 0,
@@ -152,15 +261,7 @@ export function createWorld(seed = 7): World {
     residents: [],
     pods: [],
     reservations: [],
-    economy: {
-      cash: 1900,
-      income: 0,
-      maintenance: 0,
-      subsidy: 0,
-      spent: 0,
-      nextGrantAt: GRANT_INTERVAL,
-      lastMaintenanceAt: 0,
-    },
+    economy: createEconomy(),
     metrics: {
       served: 0,
       walked: 0,
@@ -189,6 +290,9 @@ export function createWorld(seed = 7): World {
   const platform = berthPlacement(world, home, "platform", "west");
   if (platform)
     world.berths.push({ ...platform, id: id(world, "berth-"), paid: 0 });
+  for (const berth of world.berths.filter((b) => b.kind === "parking")) {
+    delete berth.buildingId;
+  }
   // A visible, finite starter yard. No inter-building track is prebuilt.
   const accesses = world.berths.map((b) => b.access);
   const minX = Math.min(...accesses.map((p) => p.x));
@@ -230,6 +334,33 @@ export function createWorld(seed = 7): World {
 function walkDuration(path: Point[]) {
   return Math.max(1, (pathLength(path) * CELL_METERS) / WALK_METERS_PER_SECOND);
 }
+
+/** Bound route-pair work to three walk-reachable stations at each end. */
+function stationCandidates(world: World, building: Building) {
+  const door = buildingDoor(building);
+  const ordered = world.berths
+    .filter(
+      (b) =>
+        b.kind === "platform" &&
+        !world.pendingEdits.some((edit) => edit.id === b.id),
+    )
+    .sort(
+      (a, b) =>
+        (a.buildingId === building.id ? -1 : distance(a.point, door)) -
+        (b.buildingId === building.id ? -1 : distance(b.point, door)),
+    );
+  const candidates: { berth: Berth; path: Point[]; seconds: number }[] = [];
+  for (const berth of ordered) {
+    if (berth.buildingId === building.id)
+      candidates.push({ berth, path: [], seconds: 0 });
+    else {
+      const path = findWalkPath(world, door, berth.point);
+      if (path) candidates.push({ berth, path, seconds: walkDuration(path) });
+    }
+    if (candidates.length === 3) break;
+  }
+  return candidates;
+}
 function beginJourney(world: World, resident: Resident) {
   const origin = world.buildings.find((b) => b.id === resident.atBuildingId);
   const destination = world.buildings.find(
@@ -252,30 +383,26 @@ function beginJourney(world: World, resident: Resident) {
   let best: {
     pickup: Berth;
     dropoff: Berth;
-    path: Point[];
     estimate: number;
+    waitSeconds: number;
+    rideSeconds: number;
+    distanceKm: number;
+    score: number;
+    accessPath: Point[];
+    accessSeconds: number;
   } | null = null;
-  for (const pickup of world.berths.filter(
-    (b) =>
-      b.buildingId === origin.id &&
-      b.kind === "platform" &&
-      !world.pendingEdits.some((e) => e.id === b.id),
-  )) {
-    const access = findWalkPath(world, buildingDoor(origin), pickup.point);
-    if (!access) continue;
-    for (const dropoff of world.berths.filter(
-      (b) =>
-        b.buildingId === destination.id &&
-        b.kind === "platform" &&
-        !world.pendingEdits.some((e) => e.id === b.id),
-    )) {
+  let unavailable: "no-platform" | "disconnected" | "no-pod" = "no-platform";
+  const pickups = stationCandidates(world, origin);
+  const dropoffs = stationCandidates(world, destination);
+  for (const access of pickups) {
+    const pickup = access.berth;
+    for (const egress of dropoffs) {
+      const dropoff = egress.berth;
+      if (pickup.id === dropoff.id) continue;
       const route = findTrackPath(world, pickup.point, dropoff.point);
-      const egress = findWalkPath(
-        world,
-        dropoff.point,
-        buildingDoor(destination),
-      );
-      if (!route || !egress) continue;
+      if (unavailable === "no-platform") unavailable = "disconnected";
+      if (!route) continue;
+      unavailable = "no-pod";
       let emptySeconds = Infinity;
       for (const pod of world.pods) {
         const source = world.berths.find(
@@ -290,21 +417,59 @@ function beginJourney(world: World, resident: Resident) {
               (pathLength(approach) * CELL_METERS) / POD_METERS_PER_SECOND,
           );
       }
-      const estimate =
-        walkDuration(access) +
+      if (!Number.isFinite(emptySeconds)) continue;
+      const distanceKm = (pathLength(route) * CELL_METERS) / 1000;
+      const rideSeconds = (distanceKm * 1000) / POD_METERS_PER_SECOND;
+      const queued = world.residents.filter(
+        (r) =>
+          r.status === "waiting" &&
+          r.journey?.pickupId === pickup.id &&
+          !r.journey.podId,
+      ).length;
+      const waitSeconds =
         emptySeconds +
+        (queued * (rideSeconds + BOARD_SECONDS + ALIGHT_SECONDS)) /
+          Math.max(1, world.pods.length);
+      const estimate =
+        access.seconds +
+        egress.seconds +
+        waitSeconds +
         BOARD_SECONDS +
         ALIGHT_SECONDS +
-        (pathLength(route) * CELL_METERS) / POD_METERS_PER_SECOND +
-        walkDuration(egress);
-      if (!best || estimate < best.estimate)
-        best = { pickup, dropoff, path: access, estimate };
+        rideSeconds;
+      const score =
+        estimate +
+        fareForDistance(distanceKm, fareRate(world)) * resident.fareSensitivity;
+      if (!best || score < best.score)
+        best = {
+          pickup,
+          dropoff,
+          estimate,
+          waitSeconds,
+          rideSeconds,
+          distanceKm,
+          score,
+          accessPath: access.path,
+          accessSeconds: access.seconds,
+        };
     }
   }
-  const usePod =
-    best &&
-    Number.isFinite(best.estimate) &&
-    chooseTravelMode(world, resident, baseline, best.estimate) === "pod";
+  resident.decision = decideTravel(
+    world,
+    resident,
+    baseline,
+    best
+      ? {
+          podSeconds: best.estimate,
+          waitSeconds: best.waitSeconds,
+          rideSeconds: best.rideSeconds,
+          distanceKm: best.distanceKm,
+        }
+      : null,
+    unavailable,
+  );
+  resident.decision.destinationId = destination.id;
+  const usePod = resident.decision.mode === "pod";
   const journey: Journey = {
     originId: origin.id,
     destinationId: destination.id,
@@ -312,17 +477,23 @@ function beginJourney(world: World, resident: Resident) {
     walkBaseline: baseline,
     purpose: resident.purpose,
     mode: usePod ? "pod" : "walk",
-    stage: usePod ? "access" : "direct",
+    stage: usePod ? "queue" : "direct",
   };
   if (usePod && best) {
     journey.pickupId = best.pickup.id;
     journey.dropoffId = best.dropoff.id;
-    journey.walk = {
-      path: best.path,
-      start: world.time,
-      end: world.time + walkDuration(best.path),
-    };
+    journey.farePerKm = fareRate(world);
+    journey.waitReason = "no-pod";
     journey.eta = world.time + best.estimate;
+    if (best.accessSeconds > 0) {
+      journey.stage = "access";
+      journey.walk = {
+        path: best.accessPath,
+        start: world.time,
+        end: world.time + best.accessSeconds,
+      };
+      journey.waitReason = undefined;
+    }
   } else {
     journey.walk = {
       path: direct,
@@ -332,7 +503,7 @@ function beginJourney(world: World, resident: Resident) {
     journey.eta = journey.walk.end;
   }
   resident.atBuildingId = null;
-  resident.status = "walking";
+  resident.status = usePod && journey.stage === "queue" ? "waiting" : "walking";
   resident.journey = journey;
 }
 
@@ -348,6 +519,8 @@ function finishJourney(world: World, resident: Resident) {
     endedAt: world.time,
     walkBaseline: journey.walkBaseline,
     waited: Math.max(0, (journey as Journey & { waited?: number }).waited ?? 0),
+    distanceKm: journey.distanceKm,
+    farePerKm: journey.farePerKm,
   });
   resident.atBuildingId = journey.destinationId;
   resident.journey = null;
@@ -356,10 +529,11 @@ function finishJourney(world: World, resident: Resident) {
   planNextActivity(world, resident);
 }
 
-function updatePods(world: World) {
+function updatePods(world: World, dt: number) {
   for (const pod of world.pods) {
     const plan = pod.plan;
     if (!plan) continue;
+    accruePodMovement(world, plan, world.time - dt, world.time);
     if (world.time >= plan.departure) pod.berthId = null;
     const resident = plan.residentId
       ? world.residents.find((r) => r.id === plan.residentId)
@@ -371,23 +545,29 @@ function updatePods(world: World) {
         world.time >= plan.dropoffEnd &&
         journey.stage !== "egress"
       ) {
-        const dropoff = world.berths.find((b) => b.id === plan.dropoffId)!;
+        journey.distanceKm = loadedDistanceKm(plan);
         const destination = world.buildings.find(
           (b) => b.id === journey.destinationId,
         )!;
-        const path = findWalkPath(
-          world,
-          dropoff.point,
-          buildingDoor(destination),
-        ) ?? [dropoff.point];
-        journey.stage = "egress";
-        journey.walk = {
-          path,
-          start: plan.dropoffEnd,
-          end: plan.dropoffEnd + walkDuration(path),
-        };
-        journey.eta = journey.walk.end;
-        resident.status = "walking";
+        const dropoff = world.berths.find((b) => b.id === journey.dropoffId)!;
+        if (dropoff.buildingId === destination.id)
+          finishJourney(world, resident);
+        else {
+          const path =
+            journey.egressPath ??
+            findWalkPath(world, dropoff.point, buildingDoor(destination));
+          if (path) {
+            journey.stage = "egress";
+            journey.podId = undefined;
+            journey.walk = {
+              path,
+              start: world.time,
+              end: world.time + walkDuration(path),
+            };
+            journey.eta = journey.walk.end;
+            resident.status = "walking";
+          }
+        }
       } else if (journey.stage !== "egress") {
         if (plan.dropoffStart !== undefined && world.time >= plan.dropoffStart)
           resident.status = "alighting";
@@ -435,6 +615,12 @@ function fallbackWalk(world: World, resident: Resident) {
   journey.eta = journey.walk.end;
   journey.waitReason = undefined;
   resident.status = "walking";
+  if (resident.decision)
+    resident.decision = {
+      ...resident.decision,
+      mode: "walk",
+      reason: "wait-abandoned",
+    };
 }
 
 function planUsesTrack(
@@ -548,7 +734,7 @@ function dispatch(world: World) {
   for (const resident of waiting) {
     const journey = resident.journey!;
     if (
-      world.time - journey.startedAt >
+      world.time - (journey.walk?.end ?? journey.startedAt) >
       Math.max(180, journey.walkBaseline * 0.65)
     ) {
       fallbackWalk(world, resident);
@@ -559,8 +745,15 @@ function dispatch(world: World) {
       fallbackWalk(world, resident);
       continue;
     }
-    const dropoffs = world.berths.filter(
-      (b) => b.buildingId === journey.destinationId && b.kind === "platform",
+    const destination = world.buildings.find(
+      (b) => b.id === journey.destinationId,
+    )!;
+    const stationOptions = stationCandidates(world, destination).filter(
+      (entry) => entry.berth.id !== pickup.id,
+    );
+    const dropoffs = stationOptions.map((entry) => entry.berth);
+    const egressSeconds = new Map(
+      stationOptions.map((entry) => [entry.berth.id, entry.seconds]),
     );
     const loadedSeconds = new Map(
       dropoffs.map((dropoff) => {
@@ -568,7 +761,8 @@ function dispatch(world: World) {
         return [
           dropoff.id,
           path
-            ? (pathLength(path) * CELL_METERS) / POD_METERS_PER_SECOND
+            ? (pathLength(path) * CELL_METERS) / POD_METERS_PER_SECOND +
+              egressSeconds.get(dropoff.id)!
             : Infinity,
         ] as const;
       }),
@@ -593,7 +787,7 @@ function dispatch(world: World) {
         if (
           best &&
           earliestBoardEnd + minimumLoaded + ALIGHT_SECONDS >=
-            best.dropoffEnd! - 1e-9
+            best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
         )
           break;
         for (const dropoff of dropoffs) {
@@ -602,7 +796,7 @@ function dispatch(world: World) {
             earliestBoardEnd +
               loadedSeconds.get(dropoff.id)! +
               ALIGHT_SECONDS >=
-              best.dropoffEnd! - 1e-9
+              best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
           )
             continue;
           const candidate = planService(world, pod, resident, pickup, dropoff);
@@ -614,7 +808,11 @@ function dispatch(world: World) {
             failures.add("track-busy");
             continue;
           }
-          if (!best || candidate.plan.dropoffEnd! < best.dropoffEnd!)
+          if (
+            !best ||
+            candidate.plan.dropoffEnd! + egressSeconds.get(dropoff.id)! <
+              best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!
+          )
             best = candidate.plan;
         }
       }
@@ -639,21 +837,17 @@ function dispatch(world: World) {
       commitPlan(world, best);
       journey.podId = best.podId;
       journey.dropoffId = best.dropoffId;
-      journey.eta =
-        best.dropoffEnd! +
-        walkDuration(
-          findWalkPath(
-            world,
-            world.berths.find((b) => b.id === best!.dropoffId)!.point,
-            buildingDoor(
-              world.buildings.find((b) => b.id === journey.destinationId)!,
-            ),
-          ) ?? [],
-        );
+      const egress = stationOptions.find(
+        (entry) => entry.berth.id === best.dropoffId,
+      )!;
+      journey.egressPath =
+        egress.seconds > 0 ? [...egress.path].reverse() : undefined;
+      journey.eta = best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!;
+      journey.distanceKm = loadedDistanceKm(best);
       journey.waitReason = "awaiting-pickup";
       (journey as Journey & { waited?: number }).waited = Math.max(
         0,
-        best.pickupStart! - journey.startedAt,
+        best.pickupStart! - (journey.walk?.end ?? journey.startedAt),
       );
     } else {
       journey.waitReason = reason;
@@ -697,9 +891,7 @@ export function capacityValid(world: World): boolean {
     if (!c) return false;
     c.pods++;
   }
-  return [...counts.values()].every(
-    (c) => c.pods === 0 || c.berths >= c.pods + 1,
-  );
+  return [...counts.values()].every((c) => c.berths >= c.pods);
 }
 
 function editBusy(world: World, edit: PendingEdit): boolean {
@@ -756,7 +948,7 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
         "Add parking or a connection before splitting this network.",
       );
     world.tracks = candidate.tracks;
-    world.economy.cash += track.paid;
+    book(world, "refund", track.paid);
   } else if (edit.type === "upgrade-track") {
     const track = world.tracks.find((t) => t.id === edit.id);
     const target = edit.targetLanes ?? 2;
@@ -768,7 +960,6 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
       );
     track.lanes = target;
     track.paid += edit.paid;
-    world.economy.spent += edit.paid;
   } else {
     const berth = world.berths.find((b) => b.id === edit.id);
     if (!berth)
@@ -778,7 +969,13 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
       berths: world.berths.filter((b) => b.id !== edit.id),
     };
     if (edit.type === "move-berth") {
-      const building = world.buildings.find((b) => b.id === berth.buildingId)!;
+      const building = world.buildings.find((b) => b.id === berth.buildingId);
+      if (!building || berth.kind === "parking")
+        return result(
+          false,
+          "请拆除后在新位置重建。",
+          "Remove and rebuild this berth at its new location.",
+        );
       const placement = berthPlacement(
         candidate,
         building,
@@ -797,10 +994,10 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
       return result(
         false,
         "请为车辆保留足够的停车与周转空间。",
-        "Keep enough parking and one spare berth per operating network.",
+        "Keep a reachable parking bay for every Pod.",
       );
     world.berths = candidate.berths;
-    if (edit.type === "remove-berth") world.economy.cash += berth.paid;
+    if (edit.type === "remove-berth") book(world, "refund", berth.paid);
   }
   world.reservations = world.reservations.filter((r) => r.end > world.time);
   world.networkVersion++;
@@ -840,7 +1037,7 @@ function processPending(world: World) {
     }
     const outcome = executeEdit(world, edit);
     if (!outcome.ok && edit.type === "upgrade-track")
-      world.economy.cash += edit.paid;
+      book(world, "refund", edit.paid);
     world.pendingEdits = world.pendingEdits.filter((e) => e !== edit);
     notice(
       world,
@@ -857,7 +1054,7 @@ export function stepWorld(world: World, seconds: number): void {
   while (world.time < end) {
     const dt = Math.min(1, end - world.time);
     world.time += dt;
-    updatePods(world);
+    updatePods(world, dt);
     for (const resident of world.residents) {
       if (resident.status === "inside" && resident.nextDeparture <= world.time)
         beginJourney(world, resident);
@@ -886,6 +1083,46 @@ export function stepWorld(world: World, seconds: number): void {
 }
 
 export function applyCommand(world: World, command: Command): CommandResult {
+  if (command.type === "set-fare") {
+    if (
+      !Number.isFinite(command.value) ||
+      command.value < MIN_FARE_PER_KM ||
+      command.value > MAX_FARE_PER_KM
+    )
+      return result(
+        false,
+        "每公里价格须在 2–60 之间。",
+        "Price per km must be between 2 and 60.",
+      );
+    world.economy.farePerKm = money(command.value);
+    return result(
+      true,
+      `后续出行按 ${world.economy.farePerKm}/公里计费。`,
+      `New trips cost ${world.economy.farePerKm}/km.`,
+    );
+  }
+  if (command.type === "take-loan") {
+    const ok = takeLoan(world);
+    return result(
+      ok,
+      ok
+        ? "贷款 5000 已到账；每 24 小时偿还本金并结息。"
+        : "领完 3 次补助后可贷款，已有贷款须先结清。",
+      ok
+        ? "Loan of 5,000 received; installments and interest every 24 hours."
+        : "Claim all 3 grants and settle any existing loan first.",
+    );
+  }
+  if (command.type === "repay-loan") {
+    const ok = repayLoan(world);
+    return result(
+      ok,
+      ok ? "贷款已结清。" : "没有未结清贷款，或现金不足以还清本金。",
+      ok
+        ? "Loan repaid in full."
+        : "No outstanding loan, or insufficient cash to repay it.",
+    );
+  }
   if (command.type === "claim-grant") {
     const amount = claimGrant(world);
     return result(
@@ -894,12 +1131,14 @@ export function applyCommand(world: World, command: Command): CommandResult {
       amount > 0 ? `Grant claimed: +${amount}.` : "No grant is ready to claim.",
     );
   }
-  if (command.type === "pause") {
-    world.paused = command.value;
+  if (command.type === "pause" || command.type === "toggle-pause") {
+    // Toggle the authoritative state, not a potentially stale UI snapshot.
+    world.paused =
+      command.type === "toggle-pause" ? !world.paused : command.value;
     return result(
       true,
-      command.value ? "已暂停，可继续设计。" : "城市开始运行。",
-      command.value ? "Paused. Keep designing." : "City running.",
+      world.paused ? "已暂停，可继续设计。" : "城市开始运行。",
+      world.paused ? "Paused. Keep designing." : "City running.",
     );
   }
   if (command.type === "speed") {
@@ -917,9 +1156,13 @@ export function applyCommand(world: World, command: Command): CommandResult {
     );
   }
   if (command.type === "cancel-edits") {
-    world.economy.cash += world.pendingEdits.reduce(
-      (sum, edit) => sum + (edit.type === "upgrade-track" ? edit.paid : 0),
-      0,
+    book(
+      world,
+      "refund",
+      world.pendingEdits.reduce(
+        (sum, edit) => sum + (edit.type === "upgrade-track" ? edit.paid : 0),
+        0,
+      ),
     );
     world.pendingEdits = [];
     return result(true, "已取消待执行改造。", "Pending edits cancelled.");
@@ -956,8 +1199,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
         "An active journey uses this junction. Wait for it to clear before building.",
       );
     world.tracks.push(...draft.edges);
-    world.economy.cash -= draft.cost;
-    world.economy.spent += draft.cost;
+    book(world, "track-build", -draft.cost);
     world.networkVersion++;
     return result(
       true,
@@ -965,41 +1207,121 @@ export function applyCommand(world: World, command: Command): CommandResult {
       `Built ${draft.edges.length} track sections.`,
     );
   }
-  if (command.type === "add-berth") {
-    const building = world.buildings.find((b) => b.id === command.buildingId);
+  if (
+    command.type === "add-berth" ||
+    command.type === "add-platform" ||
+    command.type === "add-parking"
+  ) {
+    if (!["north", "east", "south", "west"].includes(command.side))
+      return result(false, "无效方向。", "Invalid side.");
+    const kind =
+      command.type === "add-parking"
+        ? "parking"
+        : command.type === "add-platform"
+          ? "platform"
+          : command.kind;
+    const building =
+      command.type !== "add-parking"
+        ? world.buildings.find((b) => b.id === command.buildingId)
+        : undefined;
+    if (command.type === "add-berth" && !building)
+      return result(false, "建筑已经不存在。", "Building no longer exists.");
+    const platform =
+      kind === "parking"
+        ? world.berths.find(
+            (b) =>
+              b.kind === "platform" &&
+              (command.type === "add-parking"
+                ? "nearPlatformId" in command && b.id === command.nearPlatformId
+                : b.buildingId === building?.id),
+          )
+        : undefined;
     if (
-      !building ||
-      !["north", "east", "south", "west"].includes(command.side) ||
-      !["platform", "parking"].includes(command.kind)
+      kind === "parking" &&
+      command.type === "add-parking" &&
+      "nearPlatformId" in command &&
+      (!platform || world.pendingEdits.some((edit) => edit.id === platform.id))
     )
-      return result(false, "无效建筑或方向。", "Invalid building or side.");
-    const cost = command.kind === "platform" ? PLATFORM_COST : PARKING_COST;
-    if (world.economy.cash < cost)
       return result(
         false,
-        "预算不足；补助可用后，请点击领取。",
-        "Not enough budget; claim a grant when it becomes available.",
+        "请先选择一个可用的乘客平台。",
+        "Select an available passenger platform first.",
       );
-    const place = berthPlacement(world, building, command.kind, command.side);
+    const parking = platform
+      ? parkingPlacement(world, platform, command.side)
+      : null;
+    let place: Omit<Berth, "id" | "paid"> | null = parking?.berth ?? null;
+    if (
+      kind === "parking" &&
+      command.type === "add-parking" &&
+      "point" in command
+    ) {
+      const offset = sideOffsets[command.side];
+      const access = {
+        x: command.point.x + offset.x,
+        y: command.point.y + offset.y,
+      };
+      if (freeBerth(world, command.point, access))
+        place = {
+          kind,
+          point: { ...command.point },
+          access,
+          side: command.side,
+        };
+    } else if (kind === "parking" && building && !platform) {
+      place = berthPlacement(world, building, kind, command.side);
+      if (place) delete place.buildingId;
+    } else if (kind === "platform") {
+      if (building)
+        place = berthPlacement(world, building, "platform", command.side);
+      else if (
+        command.type === "add-platform" &&
+        !command.buildingId &&
+        command.point
+      ) {
+        const offset = sideOffsets[command.side];
+        const access = {
+          x: command.point.x + offset.x,
+          y: command.point.y + offset.y,
+        };
+        if (freeBerth(world, command.point, access))
+          place = {
+            kind,
+            point: { ...command.point },
+            access,
+            side: command.side,
+          };
+      }
+    }
     if (!place)
       return result(
         false,
         "这一侧没有空间，请换一个方向。",
         "No room on this side. Try another side.",
       );
+    const berthCost = kind === "platform" ? PLATFORM_COST : PARKING_COST;
+    const cost = berthCost + (parking?.trackCost ?? 0);
+    if (world.economy.cash < cost)
+      return result(
+        false,
+        "预算不足，费用包含停车接入轨道。",
+        "Not enough budget, including parking access track.",
+      );
     const candidateBerth = {
       ...place,
       id: "candidate-berth",
-      paid: cost,
+      paid: berthCost,
     };
     const candidate = {
       ...world,
       berths: [...world.berths, candidateBerth],
+      tracks: [...world.tracks, ...(parking?.tracks ?? [])],
     };
     if (
       topologyChangeTouchesActivePlan(world, candidate, [
         place.point,
         place.access,
+        ...(parking?.tracks.flatMap((track) => [track.a, track.b]) ?? []),
       ])
     )
       return result(
@@ -1007,14 +1329,23 @@ export function applyCommand(world: World, command: Command): CommandResult {
         "此处有车辆计划正在通过，请等待排空后再建泊位。",
         "An active journey uses this junction. Wait for it to clear before adding a berth.",
       );
-    world.berths.push({ ...place, id: id(world, "berth-"), paid: cost });
-    world.economy.cash -= cost;
-    world.economy.spent += cost;
+    world.berths.push({ ...place, id: id(world, "berth-"), paid: berthCost });
+    world.tracks.push(...(parking?.tracks ?? []));
+    if (parking?.trackCost) book(world, "track-build", -parking.trackCost);
+    book(
+      world,
+      kind === "platform" ? "platform-build" : "parking-build",
+      -berthCost,
+    );
     world.networkVersion++;
     return result(
       true,
-      "泊位已建好，请将外侧接点连入轨道。",
-      "Berth built. Connect its outer access point to the network.",
+      kind === "parking"
+        ? "独立停车位已建好；连接外侧接点即可加入路网。"
+        : "平台已建好，请将外侧接点连入轨道。",
+      kind === "parking"
+        ? "Independent parking built. Connect its outer access point to the network."
+        : "Platform built. Connect its outer access point to the network.",
     );
   }
   if (command.type === "upgrade-tracks") {
@@ -1090,7 +1421,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
         targetLanes: target,
       }),
     }));
-    world.economy.cash -= total;
+    book(world, "track-build", -total);
     let completed = 0;
     for (const upgrade of busy) {
       if (upgrade.busy) {
@@ -1103,7 +1434,6 @@ export function applyCommand(world: World, command: Command): CommandResult {
       } else {
         upgrade.track.lanes = target;
         upgrade.track.paid += upgrade.paid;
-        world.economy.spent += upgrade.paid;
         completed++;
       }
     }
@@ -1188,7 +1518,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
       world.tracks = world.tracks.filter(
         (track) => !immediateIds.has(track.id),
       );
-      world.economy.cash += refund;
+      book(world, "refund", refund);
       world.networkVersion++;
     }
     for (const entry of queued)
@@ -1214,8 +1544,8 @@ export function applyCommand(world: World, command: Command): CommandResult {
     if (missingParking)
       return result(
         false,
-        `此路网还需 ${missingParking} 个停车位：每辆 Pod 一个，另留一个周转位。`,
-        `This network needs ${missingParking} more parking slots: one per Pod plus one spare.`,
+        `此路网还需 ${missingParking} 个停车位，每辆 Pod 需要一个。`,
+        `This network needs ${missingParking} more parking slots, one per Pod.`,
       );
     if (
       !berth ||
@@ -1246,13 +1576,12 @@ export function applyCommand(world: World, command: Command): CommandResult {
     if (!capacityValid({ ...world, pods: [...world.pods, pod] }))
       return result(
         false,
-        "请先加一个可达泊位，给车队保留周转空间。",
-        "Add a reachable berth first; keep one spare space for circulation.",
+        "请先加一个可达停车位。",
+        "Add a reachable parking bay first.",
       );
     world.nextId++;
     world.pods.push(pod);
-    world.economy.cash -= POD_COST;
-    world.economy.spent += POD_COST;
+    book(world, "pod-buy", -POD_COST);
     return result(
       true,
       "新 Pod 已进入车队。",
@@ -1270,7 +1599,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
     if (world.pods.length <= 1)
       return result(false, "保留至少一辆 Pod。", "Keep at least one Pod.");
     world.pods = world.pods.filter((p) => p.id !== pod.id);
-    world.economy.cash += Math.floor(pod.paid * 0.85);
+    book(world, "refund", Math.floor(pod.paid * 0.85));
     return result(true, "Pod 已回售。", "Pod returned.");
   }
   if (

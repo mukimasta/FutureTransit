@@ -15,7 +15,6 @@ import {
   LocateFixed,
   Map as MapIcon,
   MousePointer2,
-  ParkingCircle,
   Pause,
   Play,
   Plus,
@@ -55,12 +54,17 @@ import {
 } from "../persistence";
 import { MapView } from "../rendering/MapView";
 import {
-  PARKING_COST,
-  PLATFORM_COST,
-  POD_COST,
-  TRACK_UPGRADE_COST,
-  MAX_PODS,
-} from "../shared/constants";
+  editorContext as makeEditorContext,
+  placementPreview as getPlacementPreview,
+  trackStart,
+  type BuildKind,
+  type EditorContext,
+} from "./editor";
+import type { MapAction } from "../rendering/types";
+import { EconomyPanel } from "./EconomyPanel";
+import { TravelChoice } from "./TravelChoice";
+import { GOVERNMENT_GRANT_AMOUNT, GOVERNMENT_GRANTS } from "../economy/config";
+import { POD_COST, TRACK_UPGRADE_COST, MAX_PODS } from "../shared/constants";
 import { buildingDevelopmentStats } from "../shared/development";
 import {
   berthOccupant,
@@ -212,7 +216,7 @@ function ToolButton({
 export default function App() {
   const { world, send, replaceWorld, lastResult } = useSimulation();
   const [language, setLanguage] = useState<Language>("zh");
-  const [tool, setTool] = useState<Tool>("select");
+  const [tool, setTool] = useState<Tool>("view");
   const [layer, setLayer] = useState<"life" | "flow">("life");
   const [selection, setSelection] = useState<Selection>(null);
   const [overviewOpen, setOverviewOpen] = useState(false);
@@ -224,9 +228,15 @@ export default function App() {
   const [mapResetToken, setMapResetToken] = useState(0);
   const [focusTarget, setFocusTarget] = useState<Selection | undefined>();
   const [draft, setDraft] = useState<Point[]>([]);
+  const [context, setContext] = useState<EditorContext | null>(null);
+  const [placing, setPlacing] = useState<"parking" | "platform" | null>(null);
   const [hoverPoint, setHoverPoint] = useState<Point | null>(null);
   const [side, setSide] = useState<Side>("east");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [economyOpen, setEconomyOpen] = useState(false);
+  const [footerDetail, setFooterDetail] = useState<
+    "service" | "waiting" | null
+  >(null);
   const [introOpen, setIntroOpen] = useState(() => !readIntroSeen());
   const [guideOpen, setGuideOpen] = useState(true);
   const [guideDismissed, setGuideDismissed] = useState(readGuideDismissed);
@@ -235,6 +245,7 @@ export default function App() {
   const [localMessage, setLocalMessage] = useState<string | null>(null);
   const [noticeVisible, setNoticeVisible] = useState(false);
   const pendingDraft = useRef(false);
+  const pendingPlacement = useRef(false);
   const importRef = useRef<HTMLInputElement>(null);
   const dismissGuide = () => {
     setGuideDismissed(true);
@@ -246,8 +257,16 @@ export default function App() {
     () => (world ? validateTrackDraft(world, draft) : null),
     [draft, world],
   );
+  const placement = useMemo(
+    () =>
+      world && context && placing
+        ? getPlacementPreview(world, context, placing, hoverPoint)
+        : null,
+    [world, context, placing, hoverPoint],
+  );
   const candidateDraft = useMemo(
-    () => previewPoints(draft, tool === "track" ? hoverPoint : null),
+    () =>
+      previewPoints(draft, tool === "edit" && draft.length ? hoverPoint : null),
     [draft, hoverPoint, tool],
   );
   const candidateReview = useMemo(
@@ -259,9 +278,6 @@ export default function App() {
       previous?.x === point?.x && previous?.y === point?.y ? previous : point,
     );
   const stats = useMemo(() => (world ? cityStats(world) : null), [world]);
-  const availableGrant =
-    (world?.economy.pendingGrant ?? 0) +
-    (world?.economy.pendingGrowthGrant ?? 0);
   const parkingMissing = useMemo(
     () => (world ? parkingShortage(world) : 0),
     [world],
@@ -279,11 +295,8 @@ export default function App() {
     (sum, track) => sum + track.paid,
     0,
   );
-  const pendingSelectedCount =
-    world?.pendingEdits.filter((edit) => selectedTrackIds.includes(edit.id))
-      .length ?? 0;
   const removeSelectedTracks = () => {
-    if (removableTracks.length)
+    if (tool === "edit" && removableTracks.length)
       send({
         type: "remove-tracks",
         ids: removableTracks.map((track) => track.id),
@@ -308,7 +321,14 @@ export default function App() {
     if (world && world.metrics.served > 0 && !guideReplay && !guideDismissed)
       dismissGuide();
   }, [world?.metrics.served, guideReplay, guideDismissed]);
-  useEffect(() => setHoverPoint(null), [tool]);
+  useEffect(() => {
+    setHoverPoint(null);
+    if (tool === "view") {
+      setContext(null);
+      setPlacing(null);
+      setDraft([]);
+    } else if (world) setContext(makeEditorContext(world, selection));
+  }, [tool]);
   useEffect(() => {
     setLocalMessage(null);
   }, [lastResult]);
@@ -350,10 +370,30 @@ export default function App() {
     pendingDraft.current = false;
     if (lastResult.ok) setDraft([]);
   }, [lastResult]);
+  useEffect(() => {
+    if (!lastResult || !pendingPlacement.current) return;
+    pendingPlacement.current = false;
+    if (lastResult.ok) {
+      setPlacing(null);
+      setContext(null);
+      setHoverPoint(null);
+    }
+  }, [lastResult]);
+  useEffect(() => {
+    if (
+      world &&
+      context?.selection &&
+      !makeEditorContext(world, context.selection, context.point)
+    ) {
+      setContext(null);
+      setPlacing(null);
+    }
+  }, [world, context]);
 
   const finishDraft = () => {
     if (
       !world ||
+      tool !== "edit" ||
       draft.length < 2 ||
       !draftReview ||
       draftReview.error ||
@@ -363,12 +403,39 @@ export default function App() {
     pendingDraft.current = true;
     send({ type: "build-track", points: draft });
   };
-  const activateRemoval = () => {
-    setTool("remove");
-    setInspectorHidden(true);
-    setOverviewOpen(false);
-    setFocusTarget(undefined);
-  };
+  useEffect(() => {
+    // Capture Space before focused SVG/HTML buttons can activate themselves.
+    // Keyup is suppressed too, since native buttons activate on release.
+    const onSpace = (event: KeyboardEvent) => {
+      if (
+        !world ||
+        introOpen ||
+        event.isComposing ||
+        (event.code !== "Space" && event.key !== " ") ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey
+      )
+        return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.isContentEditable ||
+          ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName))
+      )
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.type === "keydown" && !event.repeat)
+        send({ type: "toggle-pause" });
+    };
+    window.addEventListener("keydown", onSpace, true);
+    window.addEventListener("keyup", onSpace, true);
+    return () => {
+      window.removeEventListener("keydown", onSpace, true);
+      window.removeEventListener("keyup", onSpace, true);
+    };
+  }, [!!world, introOpen, send]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -381,30 +448,47 @@ export default function App() {
       )
         return;
       if (event.key === "Escape") {
-        if (draft.length) setDraft([]);
+        if (placing) {
+          setPlacing(null);
+          setHoverPoint(null);
+        } else if (draft.length) setDraft([]);
         else {
           setSelection(null);
           setSelectedTrackIds([]);
+          setContext(null);
           setFocusTarget(undefined);
           setOverviewOpen(false);
           setInspectorHidden(false);
           setSettingsOpen(false);
+          setEconomyOpen(false);
+          setFooterDetail(null);
         }
       } else if (event.key === "Backspace" && draft.length) {
         event.preventDefault();
         setDraft((points) => points.slice(0, -1));
-      } else if (event.key === "Enter" && tool === "track") {
+      } else if (
+        (event.key === "Backspace" || event.key === "Delete") &&
+        selection &&
+        tool === "edit"
+      ) {
+        event.preventDefault();
+        if (selection.kind === "track") removeSelectedTracks();
+        else if (selection.kind === "berth")
+          send({ type: "remove-berth", id: selection.id });
+        else if (selection.kind === "pod") {
+          const pod = world?.pods.find((item) => item.id === selection.id);
+          if (pod && !pod.plan) send({ type: "sell-pod", id: pod.id });
+        }
+      } else if (event.key === "Enter" && tool === "edit" && draft.length) {
         event.preventDefault();
         finishDraft();
-      } else if (event.key.toLowerCase() === "t") {
-        setTool("track");
-      } else if (event.key.toLowerCase() === "x") {
-        activateRemoval();
-      } else if (event.key.toLowerCase() === "v") {
-        setTool("select");
-      } else if (event.code === "Space" && world) {
+      } else if (event.key === "Tab") {
         event.preventDefault();
-        send({ type: "pause", value: !world.paused });
+        setTool((current) => (current === "edit" ? "view" : "edit"));
+      } else if (event.key.toLowerCase() === "t") {
+        setTool("edit");
+      } else if (event.key.toLowerCase() === "v") {
+        setTool("view");
       } else if (event.key.toLowerCase() === "h") {
         setFocusTarget(undefined);
         setMapResetToken((t) => t + 1);
@@ -427,27 +511,39 @@ export default function App() {
   }
 
   const tx = (zh: string, en: string) => text(language, zh, en);
+  const serviceTotal = stats.served + stats.walked;
+  const waitingResidents = world.residents.filter(
+    (resident) => resident.status === "waiting",
+  );
+  const recentTrips = [...world.metrics.recentTrips].reverse().slice(0, 8);
   const focus = (next: NonNullable<Selection>) => {
-    setTool("select");
+    setContext(tool === "edit" ? makeEditorContext(world, next) : null);
+    setPlacing(null);
+    setFooterDetail(null);
     setOverviewOpen(false);
     setInspectorHidden(false);
     setSelection(next);
     setFocusTarget(undefined);
     window.requestAnimationFrame(() => setFocusTarget(next));
   };
-  const onSelect = (next: Selection, modifiers: SelectionModifiers = {}) => {
+  const onSelect = (
+    next: Selection,
+    modifiers: SelectionModifiers = {},
+    point?: Point,
+  ) => {
+    setContext(tool === "edit" ? makeEditorContext(world, next, point) : null);
+    setPlacing(null);
     setFocusTarget(undefined);
     setOverviewOpen(false);
-    if (!modifiers.additive && !modifiers.range)
-      setInspectorHidden(tool === "remove");
+    if (!modifiers.additive && !modifiers.range) setInspectorHidden(false);
     if (!next) {
-      if (tool !== "track") {
+      if (!draft.length) {
         setSelection(null);
         setSelectedTrackIds([]);
       }
       return;
     }
-    if (next.kind === "track" && tool !== "track") {
+    if (next.kind === "track" && !draft.length) {
       const corridor = modifiers.single
         ? [next.id]
         : corridorTracks(world, next.id);
@@ -474,18 +570,52 @@ export default function App() {
       else setSelectedTrackIds(corridor);
     } else setSelectedTrackIds([]);
     setSelection(next);
-    if (tool === "remove" && next.kind === "berth")
-      send({ type: "remove-berth", id: next.id });
   };
   const onMapPoint = (point: Point) => {
-    if (tool !== "track") return;
+    if (tool !== "edit" || !draft.length) return;
     setHoverPoint(null);
-    setDraft((points) => {
-      const last = points.at(-1);
-      return last?.x === point.x && last.y === point.y
-        ? points
-        : [...points, point];
-    });
+    const last = draft.at(-1);
+    if (last?.x === point.x && last.y === point.y) {
+      if (draft.length > 1) finishDraft();
+      return;
+    }
+    setDraft([...draft, point]);
+  };
+  const onEmptyPoint = (point: Point) => {
+    if (tool !== "edit") return;
+    setSelection(null);
+    setSelectedTrackIds([]);
+    setFocusTarget(undefined);
+    setOverviewOpen(false);
+    setInspectorHidden(false);
+    setContext({ point, selection: null });
+    setPlacing(null);
+  };
+  const chooseBuild = (kind: BuildKind) => {
+    if (tool !== "edit" || !context) return;
+    setHoverPoint(null);
+    if (kind === "track") {
+      setPlacing(null);
+      setDraft([trackStart(world, context)]);
+      setSelectedTrackIds([]);
+    } else {
+      setDraft([]);
+      setPlacing(kind);
+    }
+  };
+  const onPlacePoint = (point: Point) => {
+    if (tool !== "edit" || !context || !placing || pendingPlacement.current)
+      return;
+    const preview = getPlacementPreview(world, context, placing, point);
+    setHoverPoint(point);
+    if (!preview?.valid) return;
+    pendingPlacement.current = true;
+    send(preview.command);
+  };
+  const onMapAction = (action: MapAction) => {
+    if (tool !== "edit") return;
+    if (action.type === "choose-build") chooseBuild(action.kind);
+    else send(action);
   };
 
   const homePlatform = world.berths.find(
@@ -508,7 +638,7 @@ export default function App() {
   const selectGuideStep = (index: number) => {
     if (index === 0 && office) focus({ kind: "building", id: office.id });
     if (index === 1) {
-      setTool("track");
+      setTool("edit");
       setDraft(homePlatform ? [homePlatform.access] : []);
       setSelection(null);
       setFocusTarget(undefined);
@@ -532,6 +662,9 @@ export default function App() {
     if (!confirmed) return;
     setSelection(null);
     setDraft([]);
+    setContext(null);
+    setPlacing(null);
+    setHoverPoint(null);
     setSettingsOpen(false);
     setDidFollowResident(false);
     setGuideReplay(false);
@@ -568,6 +701,9 @@ export default function App() {
       replaceWorld(next);
       setSelection(null);
       setDraft([]);
+      setContext(null);
+      setPlacing(null);
+      setHoverPoint(null);
       setSettingsOpen(false);
       setLocalMessage(
         tx(
@@ -600,6 +736,33 @@ export default function App() {
               )}
             </p>
           </div>
+          <label className="switch-row growth-control" htmlFor="city-growth">
+            <span>
+              <strong>{tx("城市增长", "City growth")}</strong>
+              <small id="city-growth-description">
+                {world.growth.enabled
+                  ? tx(
+                      "持续新增建筑与后续入驻",
+                      "New buildings and move-ins are enabled",
+                    )
+                  : tx(
+                      "已暂停新增建筑与后续入驻",
+                      "New buildings and move-ins are paused",
+                    )}
+              </small>
+            </span>
+            <input
+              id="city-growth"
+              type="checkbox"
+              role="switch"
+              aria-label={tx("城市增长", "City growth")}
+              aria-describedby="city-growth-description"
+              checked={world.growth.enabled}
+              onChange={(event) =>
+                send({ type: "growth", value: event.target.checked })
+              }
+            />
+          </label>
           <div className="mini-grid">
             <div>
               <Users size={15} />
@@ -698,8 +861,8 @@ export default function App() {
                   `Parking shortage ${parkingMissing}: add connected parking. Existing Pods are preserved; extra purchases are blocked.`,
                 )
               : tx(
-                  "停车规则：每辆 Pod 一个专用位，每个运营路网另留一个周转位。",
-                  "Parking: one space per Pod plus one spare per operating network.",
+                  "停车规则：每辆 Pod 需要一个专用停车位。",
+                  "Parking: one dedicated space per Pod.",
                 )}
           </p>
           <div className="details">
@@ -748,6 +911,9 @@ export default function App() {
         world.berths
           .filter((berth) => berth.buildingId === building.id)
           .map((berth) => berth.id),
+      );
+      const buildingBerths = world.berths.filter(
+        (berth) => berth.buildingId === building.id,
       );
       const waiting = world.residents.filter(
         (resident) =>
@@ -928,71 +1094,33 @@ export default function App() {
               </EmptyLine>
             )}
           </div>
-          <SectionTitle>{tx("新增泊位", "Add a berth")}</SectionTitle>
-          <div
-            className="side-picker"
-            aria-label={tx("选择建筑方向", "Choose building side")}
-          >
-            {SIDES.map((item) => (
-              <button
-                className={side === item ? "is-active" : ""}
-                type="button"
-                key={item}
-                onClick={() => setSide(item)}
-              >
-                {sideName(item, language)}
-              </button>
-            ))}
-          </div>
-          <div className="button-pair">
-            <button
-              className="primary-action"
-              type="button"
-              onClick={() =>
-                send({
-                  type: "add-berth",
-                  buildingId: building.id,
-                  kind: "platform",
-                  side,
-                })
-              }
-            >
-              <Plus size={15} />
-              {tx(`平台 ${PLATFORM_COST}`, `Platform ${PLATFORM_COST}`)}
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                send({
-                  type: "add-berth",
-                  buildingId: building.id,
-                  kind: "parking",
-                  side,
-                })
-              }
-            >
-              <ParkingCircle size={15} />
-              {tx(`停车 ${PARKING_COST}`, `Parking ${PARKING_COST}`)}
-            </button>
-          </div>
+          <p className="map-control-note">
+            {tool === "view"
+              ? tx(
+                  "查看模式只看详情；按 Tab 切到编辑后可建设。",
+                  "View mode is read-only; press Tab to edit.",
+                )
+              : tx(
+                  "点地图上的「站点」或「停车位」，移动鼠标选方向，再点击确认。停车位也可在空地独立建设。",
+                  "Choose Station or Parking on the map, move to choose a direction, then click to build. Parking can also stand on free land.",
+                )}
+          </p>
           <SectionTitle>{tx("建筑泊位", "Building berths")}</SectionTitle>
           <div className="entity-list">
-            {world.berths
-              .filter((b) => b.buildingId === building.id)
-              .map((b) => (
-                <button
-                  className="entity-row"
-                  type="button"
-                  key={b.id}
-                  onClick={() => focus({ kind: "berth", id: b.id })}
-                >
-                  {b.kind === "platform"
-                    ? tx("平台", "Platform")
-                    : tx("停车位", "Parking")}{" "}
-                  {shortId(b.id)} · {sideName(b.side, language)}{" "}
-                  {berthOccupant(world, b.id) ? " · Pod" : ""}
-                </button>
-              ))}
+            {buildingBerths.map((b) => (
+              <button
+                className="entity-row"
+                type="button"
+                key={b.id}
+                onClick={() => focus({ kind: "berth", id: b.id })}
+              >
+                {b.kind === "platform"
+                  ? tx("平台", "Platform")
+                  : tx("停车位", "Parking")}{" "}
+                {shortId(b.id)} · {sideName(b.side, language)}{" "}
+                {berthOccupant(world, b.id) ? " · Pod" : ""}
+              </button>
+            ))}
           </div>
           <SectionTitle count={waiting.length}>
             {tx("候车与目的地", "Waiting & destinations")}
@@ -1038,7 +1166,7 @@ export default function App() {
       const berth = world.berths.find((item) => item.id === selection.id)!;
       const building = world.buildings.find(
         (item) => item.id === berth.buildingId,
-      )!;
+      );
       const occupant = berthOccupant(world, berth.id);
       const queue = world.residents.filter(
         (resident) =>
@@ -1059,7 +1187,15 @@ export default function App() {
                 : tx("停车位", "PARKING")}{" "}
               · {shortId(berth.id)}
             </span>
-            <h2>{language === "zh" ? building.name : building.nameEn}</h2>
+            <h2>
+              {building
+                ? language === "zh"
+                  ? building.name
+                  : building.nameEn
+                : berth.kind === "parking"
+                  ? tx("独立停车位", "Independent parking")
+                  : tx("独立站", "Standalone station")}
+            </h2>
             <p>
               {sideName(berth.side, language)} {tx("侧", "side")} ·{" "}
               {occupant
@@ -1093,16 +1229,20 @@ export default function App() {
               <EmptyLine>{tx("队列为空。", "The queue is empty.")}</EmptyLine>
             )}
           </div>
-          <SectionTitle>{tx("泊位操作", "Berth actions")}</SectionTitle>
+          <SectionTitle>
+            {tool === "edit"
+              ? tx("泊位操作", "Berth actions")
+              : tx("泊位情况", "Berth details")}
+          </SectionTitle>
           {berth.kind === "parking" && (
             <p className="flow-legend">
               {tx(
-                `本路网 ${parkingGroup?.parking ?? 0} 个停车位 / ${parkingGroup?.podIds.length ?? 0} 辆 Pod；保留 1 个周转位。`,
-                `This network: ${parkingGroup?.parking ?? 0} parking / ${parkingGroup?.podIds.length ?? 0} Pods; keep one spare.`,
+                `本路网 ${parkingGroup?.parking ?? 0} 个停车位 / ${parkingGroup?.podIds.length ?? 0} 辆 Pod；每辆车需要 1 个专用位。`,
+                `This network: ${parkingGroup?.parking ?? 0} parking / ${parkingGroup?.podIds.length ?? 0} Pods; one dedicated space per Pod.`,
               )}
             </p>
           )}
-          {!occupant && berth.kind === "parking" && (
+          {tool === "edit" && !occupant && berth.kind === "parking" && (
             <button
               className="wide-action primary-action"
               type="button"
@@ -1130,39 +1270,43 @@ export default function App() {
           {berth.kind === "platform" && (
             <p className="flow-legend">
               {tx(
-                "平台仅供上下客；购车请选专用停车位。",
-                "Platforms are for passengers. Select dedicated parking to buy a Pod.",
+                "平台仅供上下客。停车位可建在任意空地，接入同一路网即可，不属于平台。",
+                "Platforms are for passengers. Build independent parking on free land and connect it to the same network.",
               )}
             </p>
           )}
-          <div className="side-picker compact">
-            {SIDES.map((item) => (
+          {tool === "edit" && (
+            <>
+              <div className="side-picker compact">
+                {SIDES.map((item) => (
+                  <button
+                    className={side === item ? "is-active" : ""}
+                    type="button"
+                    key={item}
+                    onClick={() => setSide(item)}
+                  >
+                    {sideName(item, language)}
+                  </button>
+                ))}
+              </div>
               <button
-                className={side === item ? "is-active" : ""}
+                className="wide-action"
                 type="button"
-                key={item}
-                onClick={() => setSide(item)}
+                onClick={() => send({ type: "move-berth", id: berth.id, side })}
               >
-                {sideName(item, language)}
+                <Route size={15} />
+                {tx("改到所选入口", "Move to selected side")}
               </button>
-            ))}
-          </div>
-          <button
-            className="wide-action"
-            type="button"
-            onClick={() => send({ type: "move-berth", id: berth.id, side })}
-          >
-            <Route size={15} />
-            {tx("改到所选入口", "Move to selected side")}
-          </button>
-          <button
-            className="wide-action danger"
-            type="button"
-            onClick={() => send({ type: "remove-berth", id: berth.id })}
-          >
-            <Trash2 size={15} />
-            {tx("移除泊位", "Remove berth")}
-          </button>
+              <button
+                className="wide-action danger"
+                type="button"
+                onClick={() => send({ type: "remove-berth", id: berth.id })}
+              >
+                <Trash2 size={15} />
+                {tx("移除泊位", "Remove berth")}
+              </button>
+            </>
+          )}
         </>
       );
     }
@@ -1173,6 +1317,15 @@ export default function App() {
       )!;
       const destination =
         resident.journey?.destinationId ?? resident.nextDestinationId;
+      const decisionDestination =
+        resident.decision &&
+        "destinationId" in resident.decision &&
+        typeof resident.decision.destinationId === "string"
+          ? resident.decision.destinationId
+          : undefined;
+      const workplace = world.buildings.find(
+        (building) => building.id === resident.workId,
+      );
       const previousTrip = [...world.metrics.recentTrips]
         .reverse()
         .find((t) => t.residentId === resident.id);
@@ -1195,8 +1348,26 @@ export default function App() {
             <DetailRow label={tx("家", "Home")}>
               {buildingName(world, resident.homeId, language)}
             </DetailRow>
-            <DetailRow label={tx("工作", "Work")}>
+            <DetailRow
+              label={
+                resident.occupation === "student" ||
+                workplace?.kind === "school"
+                  ? tx("学校", "School")
+                  : tx("工作地", "Workplace")
+              }
+            >
               {buildingName(world, resident.workId, language)}
+            </DetailRow>
+            <DetailRow label={tx("职业", "Occupation")}>
+              {resident.occupation === "student"
+                ? tx("学生", "Student")
+                : resident.occupation === "teacher"
+                  ? tx("教师", "Teacher")
+                  : resident.occupation === "medic"
+                    ? tx("医护", "Medic")
+                    : resident.occupation === "service"
+                      ? tx("服务人员", "Service worker")
+                      : tx("上班族", "Worker")}
             </DetailRow>
             <DetailRow
               label={
@@ -1254,6 +1425,15 @@ export default function App() {
               </DetailRow>
             </div>
           )}
+          <TravelChoice
+            resident={resident}
+            language={language}
+            destinationName={buildingName(
+              world,
+              decisionDestination ?? destination,
+              language,
+            )}
+          />
           {resident.journey?.podId && (
             <button
               className="wide-action primary-action"
@@ -1360,15 +1540,17 @@ export default function App() {
             <LocateFixed size={15} />
             {tx("追踪这辆 Pod", "Follow this Pod")}
           </button>
-          <button
-            className="wide-action danger"
-            type="button"
-            disabled={!!pod.plan}
-            onClick={() => send({ type: "sell-pod", id: pod.id })}
-          >
-            <Trash2 size={15} />
-            {tx("回售 Pod · 85%", "Return Pod · 85%")}
-          </button>
+          {tool === "edit" && (
+            <button
+              className="wide-action danger"
+              type="button"
+              disabled={!!pod.plan}
+              onClick={() => send({ type: "sell-pod", id: pod.id })}
+            >
+              <Trash2 size={15} />
+              {tx("回售 Pod · 85%", "Return Pod · 85%")}
+            </button>
+          )}
         </>
       );
     }
@@ -1413,48 +1595,55 @@ export default function App() {
             ({track.a.x}, {track.a.y}) → ({track.b.x}, {track.b.y})
           </p>
         </div>
-        <SectionTitle>{tx("整段改造", "Corridor editing")}</SectionTitle>
+        <SectionTitle>
+          {tool === "edit"
+            ? tx("整段改造", "Corridor editing")
+            : tx("所选轨道", "Selected tracks")}
+        </SectionTitle>
         <p className="flow-legend">
           {tx(
             `已选 ${picked.length} 个小段 · 车道双向共享`,
             `Selected ${picked.length} cells · all lanes shared both ways`,
           )}
         </p>
-        {([2, 3] as const).map((lanes) => {
-          const upgradable = picked.filter(
-            (t) =>
-              (t.lanes ?? 1) < lanes &&
-              !world.pendingEdits.some((edit) => edit.id === t.id),
-          );
-          const upgradeCost = upgradable.reduce(
-            (sum, t) =>
-              sum +
-              distance(t.a, t.b) *
-                TRACK_UPGRADE_COST *
-                (lanes - (t.lanes ?? 1)),
-            0,
-          );
-          return (
-            <button
-              key={lanes}
-              className="wide-action primary-action"
-              type="button"
-              disabled={!upgradable.length || world.economy.cash < upgradeCost}
-              onClick={() =>
-                send({
-                  type: "upgrade-tracks",
-                  lanes,
-                  ids: upgradable.map((t) => t.id),
-                })
-              }
-            >
-              {tx(
-                `升级所选为 ${lanes} 车道 · ${Math.round(upgradeCost)}`,
-                `Upgrade selection to ${lanes} lanes · ${Math.round(upgradeCost)}`,
-              )}
-            </button>
-          );
-        })}
+        {tool === "edit" &&
+          ([2, 3] as const).map((lanes) => {
+            const upgradable = picked.filter(
+              (t) =>
+                (t.lanes ?? 1) < lanes &&
+                !world.pendingEdits.some((edit) => edit.id === t.id),
+            );
+            const upgradeCost = upgradable.reduce(
+              (sum, t) =>
+                sum +
+                distance(t.a, t.b) *
+                  TRACK_UPGRADE_COST *
+                  (lanes - (t.lanes ?? 1)),
+              0,
+            );
+            return (
+              <button
+                key={lanes}
+                className="wide-action primary-action"
+                type="button"
+                disabled={
+                  !upgradable.length || world.economy.cash < upgradeCost
+                }
+                onClick={() =>
+                  send({
+                    type: "upgrade-tracks",
+                    lanes,
+                    ids: upgradable.map((t) => t.id),
+                  })
+                }
+              >
+                {tx(
+                  `升级所选为 ${lanes} 车道 · ${Math.round(upgradeCost)}`,
+                  `Upgrade selection to ${lanes} lanes · ${Math.round(upgradeCost)}`,
+                )}
+              </button>
+            );
+          })}
         <p className="flow-legend">
           {tx(
             "所有车道均可双向使用；每条同一时刻只容一辆 Pod。系统分配空闲车道，交叉口仍需协调。",
@@ -1477,6 +1666,9 @@ export default function App() {
           </div>
         )}
         <div className="details">
+          <DetailRow label={tx("此段车道", "Lanes in this section")}>
+            {track.lanes ?? 1}
+          </DetailRow>
           <DetailRow label={tx("近 5 分钟占用", "Last 5 min occupied")}>
             {formatDuration(recentSeconds, language)}
           </DetailRow>
@@ -1487,18 +1679,20 @@ export default function App() {
             {Math.round(track.paid)}
           </DetailRow>
         </div>
-        <button
-          className="wide-action danger"
-          type="button"
-          disabled={!removableTracks.length}
-          onClick={removeSelectedTracks}
-        >
-          <Trash2 size={15} />
-          {tx(
-            `拆除所选 ${removableTracks.length} 段 · 退 ${Math.round(removalRefund)}`,
-            `Remove ${removableTracks.length} selected · refund ${Math.round(removalRefund)}`,
-          )}
-        </button>
+        {tool === "edit" && (
+          <button
+            className="wide-action danger"
+            type="button"
+            disabled={!removableTracks.length}
+            onClick={removeSelectedTracks}
+          >
+            <Trash2 size={15} />
+            {tx(
+              `拆除所选 ${removableTracks.length} 段 · 退 ${Math.round(removalRefund)}`,
+              `Remove ${removableTracks.length} selected · refund ${Math.round(removalRefund)}`,
+            )}
+          </button>
+        )}
       </>
     );
   };
@@ -1526,8 +1720,8 @@ export default function App() {
           <span
             className="sim-time"
             title={tx(
-              "每 30 秒现实时间推进 10 分钟（1×）；车辆连续运行",
-              "10 city minutes per 30 real seconds at 1x; continuous traffic",
+              "每 2 秒现实时间推进 1 分钟（1×）；车辆连续运行",
+              "1 city minute per 2 real seconds at 1x; continuous traffic",
             )}
           >
             <small>
@@ -1536,7 +1730,7 @@ export default function App() {
                 `Day ${Math.floor((world.time + 7 * 3600) / 86400) + 1}`,
               )}
             </small>{" "}
-            {formatClock(world.time, 10)}
+            {formatClock(world.time)}
           </span>
           <span className={`run-state ${world.paused ? "paused" : ""}`}>
             {world.paused ? tx("已暂停", "Paused") : tx("运行中", "Running")}
@@ -1546,8 +1740,13 @@ export default function App() {
           <button
             className="round-button"
             type="button"
-            onClick={() => send({ type: "pause", value: !world.paused })}
-            title={world.paused ? tx("继续", "Resume") : tx("暂停", "Pause")}
+            onClick={() => send({ type: "toggle-pause" })}
+            aria-keyshortcuts="Space"
+            title={
+              world.paused
+                ? tx("继续（空格）", "Resume (Space)")
+                : tx("暂停（空格）", "Pause (Space)")
+            }
           >
             {world.paused ? <Play size={15} /> : <Pause size={15} />}
           </button>
@@ -1594,44 +1793,13 @@ export default function App() {
                 <X size={14} />
               </button>
             </div>
-            <label className="switch-row">
-              <span>
-                <strong>{tx("城市增长", "City growth")}</strong>
-                <small>
-                  {tx(
-                    "暂停新增建筑与后续入驻",
-                    "Pause new buildings and occupancy phases",
-                  )}
-                </small>
-              </span>
-              <input
-                type="checkbox"
-                checked={world.growth.enabled}
-                onChange={(event) =>
-                  send({ type: "growth", value: event.target.checked })
-                }
-              />
-            </label>
             <p className="empty-line">
               {tx(
-                "余额低于 3,000 时，每 30 分钟城市时间开放领取 280（最多保留一期）；新街区补助 900 可累积。所有补助需手动领取。维护最多使用票款的 20%。",
-                "Below 3,000 cash: claim 280 every 30 city minutes (one pending installment). District grants of 900 accumulate. All grants must be claimed manually. Upkeep uses at most 20% of fares.",
+                `经济账本里可调整每公里票价，并手动领取至多 ${GOVERNMENT_GRANTS} 次补助（每次 ${GOVERNMENT_GRANT_AMOUNT}）。`,
+                `Use the economy ledger to adjust fare per km and manually claim up to ${GOVERNMENT_GRANTS} grants (${GOVERNMENT_GRANT_AMOUNT} each).`,
               )}
             </p>
-            <button
-              className="wide-action"
-              type="button"
-              disabled={availableGrant <= 0}
-              onClick={() => send({ type: "claim-grant" })}
-            >
-              {availableGrant > 0
-                ? tx(
-                    `领取补助 +${availableGrant}`,
-                    `Claim grant +${availableGrant}`,
-                  )
-                : tx("暂无待领取补助", "No grant ready")}
-            </button>
-            {world.pendingEdits.length > 0 && (
+            {tool === "edit" && world.pendingEdits.length > 0 && (
               <button
                 className="wide-action"
                 type="button"
@@ -1695,6 +1863,11 @@ export default function App() {
                       );
                     else {
                       replaceWorld(saved);
+                      setSelection(null);
+                      setDraft([]);
+                      setContext(null);
+                      setPlacing(null);
+                      setHoverPoint(null);
                       setLocalMessage(
                         tx("已载入本机存档。", "Local save loaded."),
                       );
@@ -1736,25 +1909,18 @@ export default function App() {
       >
         <nav className="tool-rail" aria-label={tx("地图工具", "Map tools")}>
           <ToolButton
-            active={tool === "select"}
+            active={tool === "view"}
             label={tx("查看", "View")}
-            shortcut="V"
+            shortcut="Tab"
             icon={<MousePointer2 size={18} />}
-            onClick={() => setTool("select")}
+            onClick={() => setTool("view")}
           />
           <ToolButton
-            active={tool === "track"}
-            label={tx("铺轨", "Track")}
-            shortcut="T"
+            active={tool === "edit"}
+            label={tx("编辑", "Edit")}
+            shortcut="Tab"
             icon={<Route size={18} />}
-            onClick={() => setTool("track")}
-          />
-          <ToolButton
-            active={tool === "remove"}
-            label={tx("拆除", "Remove")}
-            shortcut="X"
-            icon={<Trash2 size={18} />}
-            onClick={activateRemoval}
+            onClick={() => setTool("edit")}
           />
           <span className="rail-spacer" />
           <button
@@ -1790,10 +1956,18 @@ export default function App() {
             selection={selection}
             onSelect={onSelect}
             tool={tool}
-            draft={tool === "track" ? draft : []}
+            draft={tool === "edit" ? draft : []}
             onMapPoint={onMapPoint}
+            onEmptyPoint={onEmptyPoint}
+            context={tool === "edit" ? context : null}
+            placing={tool === "edit" && !!placing}
+            placement={tool === "edit" ? placement : null}
+            onPlacePoint={onPlacePoint}
+            onMapAction={onMapAction}
             onHoverPoint={onHoverPoint}
-            candidateDraft={tool === "track" ? candidateDraft : []}
+            candidateDraft={
+              tool === "edit" && draft.length ? candidateDraft : []
+            }
             candidateInvalid={
               !!candidateReview?.error ||
               (candidateReview?.cost ?? 0) > world.economy.cash
@@ -1808,6 +1982,42 @@ export default function App() {
             buildingFlow={flows}
             resetViewToken={mapResetToken}
           />
+          {tool === "edit" && placing && (
+            <div
+              className={`draft-card${placement && !placement.valid ? " has-error" : ""}`}
+            >
+              <span className="draft-icon">
+                <Plus size={20} />
+              </span>
+              <div>
+                <strong>
+                  {placing === "parking"
+                    ? tx("建停车位", "Build parking")
+                    : tx("建站点", "Build station")}
+                  {placement ? ` · ${placement.cost}` : ""}
+                </strong>
+                <small>
+                  {placement && !placement.valid
+                    ? tx(
+                        "此方向空间不足或预算不足，移动鼠标换方向",
+                        "Blocked or over budget; move the pointer to another direction",
+                      )
+                    : tx(
+                        "移动鼠标选方向 · 点击地图确认 · Esc 返回",
+                        "Move to choose direction · Click map to build · Esc back",
+                      )}
+                </small>
+              </div>
+            </div>
+          )}
+          {economyOpen && (
+            <EconomyPanel
+              world={world}
+              language={language}
+              send={send}
+              onClose={() => setEconomyOpen(false)}
+            />
+          )}
           {inspectorHidden && (
             <button
               className="inspection-reopen"
@@ -1888,46 +2098,7 @@ export default function App() {
             </aside>
           )}
 
-          {tool === "remove" && (
-            <div className="draft-card demolition-card">
-              <span className="draft-icon">
-                <Trash2 size={16} />
-              </span>
-              <div>
-                <strong>
-                  {tx(
-                    `待拆 ${removableTracks.length} 段 · 退款 ${Math.round(removalRefund)}`,
-                    `${removableTracks.length} selected · refund ${Math.round(removalRefund)}`,
-                  )}
-                </strong>
-                <small>
-                  {tx(
-                    "点击选整段 · ⌘/Ctrl 多选 · Shift 连选",
-                    "Click corridor · ⌘/Ctrl add · Shift range",
-                  )}
-                </small>
-                <small>
-                  {pendingSelectedCount
-                    ? tx(
-                        `${pendingSelectedCount} 段等待改造完成；恢复运行后排空。`,
-                        `${pendingSelectedCount} pending; resume to clear existing traffic.`,
-                      )
-                    : tx(
-                        "确认后拆除；在途车辆先排空。Esc 取消选择。",
-                        "Confirm to remove; active traffic clears first. Esc clears selection.",
-                      )}
-                </small>
-              </div>
-              <button
-                type="button"
-                disabled={!removableTracks.length}
-                onClick={removeSelectedTracks}
-              >
-                {tx("确认拆除", "Confirm removal")}
-              </button>
-            </div>
-          )}
-          {tool === "track" && (
+          {tool === "edit" && draft.length > 0 && (
             <div
               className={`draft-card${candidateReview?.error && candidateDraft.length > 1 ? " has-error" : ""}`}
             >
@@ -2000,11 +2171,93 @@ export default function App() {
               </button>
             )}
           </div>
-          <div className="inspector-content">{renderInspector()}</div>
+          <div
+            className="inspector-content"
+            key={selection ? `${selection.kind}:${selection.id}` : "overview"}
+          >
+            {renderInspector()}
+          </div>
         </aside>
       </section>
 
       <footer className="statusbar">
+        {footerDetail && (
+          <aside className="status-detail-panel">
+            <div className="popover-title">
+              <span>
+                {footerDetail === "service"
+                  ? tx("服务详情", "Service detail")
+                  : tx("当前候车", "Waiting now")}
+              </span>
+              <button type="button" onClick={() => setFooterDetail(null)}>
+                <X size={14} />
+              </button>
+            </div>
+            {footerDetail === "service" ? (
+              <>
+                <p className="status-detail-summary">
+                  {tx(
+                    `Pod 完成 ${stats.served} / 已完成出行 ${serviceTotal}（含步行 ${stats.walked}）`,
+                    `${stats.served} Pod trips / ${serviceTotal} completed trips (${stats.walked} walked)`,
+                  )}
+                </p>
+                <SectionTitle count={recentTrips.length}>
+                  {tx("最近完成的出行", "Recent completed trips")}
+                </SectionTitle>
+                <div className="entity-list status-trip-list">
+                  {recentTrips.map((trip, index) => {
+                    const resident = world.residents.find(
+                      (item) => item.id === trip.residentId,
+                    );
+                    if (!resident) return null;
+                    return (
+                      <button
+                        className="entity-row"
+                        type="button"
+                        key={`${trip.residentId}-${trip.endedAt}-${index}`}
+                        onClick={() =>
+                          focus({ kind: "resident", id: resident.id })
+                        }
+                      >
+                        <i style={{ background: resident.color }} />
+                        <span>
+                          <strong>{resident.name}</strong>
+                          <small>
+                            {trip.mode === "pod" ? "Pod" : tx("步行", "Walk")} ·{" "}
+                            {buildingName(world, trip.destinationId, language)}
+                          </small>
+                        </span>
+                        <ChevronRight size={14} />
+                      </button>
+                    );
+                  })}
+                  {!recentTrips.length && (
+                    <EmptyLine>
+                      {tx("还没有完成的出行。", "No completed trips yet.")}
+                    </EmptyLine>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="entity-list status-trip-list">
+                {waitingResidents.map((resident) => (
+                  <ResidentButton
+                    key={resident.id}
+                    resident={resident}
+                    world={world}
+                    language={language}
+                    onClick={() => focus({ kind: "resident", id: resident.id })}
+                  />
+                ))}
+                {!waitingResidents.length && (
+                  <EmptyLine>
+                    {tx("现在没有人候车。", "No one is waiting now.")}
+                  </EmptyLine>
+                )}
+              </div>
+            )}
+          </aside>
+        )}
         <div className="legend">
           <span>
             <i className="legend-person" />
@@ -2024,30 +2277,48 @@ export default function App() {
           </span>
         </div>
         <div className="status-metrics">
-          <span>
+          <button
+            className="budget-button"
+            type="button"
+            onClick={() => setEconomyOpen((open) => !open)}
+            aria-expanded={economyOpen}
+            title={tx("打开经营账本", "Open economy ledger")}
+          >
             <WalletCards size={14} />
             <small>{tx("预算", "Budget")}</small>
             <strong>{Math.floor(world.economy.cash)}</strong>
-          </span>
-          {availableGrant > 0 && (
-            <button
-              className="grant-claim"
-              type="button"
-              onClick={() => send({ type: "claim-grant" })}
-            >
-              {tx("领取补助", "Claim grant")} +{availableGrant}
-            </button>
-          )}
-          <span>
+          </button>
+          <button
+            className="status-detail-button"
+            type="button"
+            aria-expanded={footerDetail === "service"}
+            onClick={() =>
+              setFooterDetail((current) =>
+                current === "service" ? null : "service",
+              )
+            }
+          >
             <Gauge size={14} />
             <small>{tx("服务占比", "Service")}</small>
-            <strong>{Math.round(stats.serviceShare * 100)}%</strong>
-          </span>
-          <span>
+            <strong>
+              {Math.round(stats.serviceShare * 100)}% · {stats.served}/
+              {serviceTotal}
+            </strong>
+          </button>
+          <button
+            className="status-detail-button"
+            type="button"
+            aria-expanded={footerDetail === "waiting"}
+            onClick={() =>
+              setFooterDetail((current) =>
+                current === "waiting" ? null : "waiting",
+              )
+            }
+          >
             <Users size={14} />
             <small>{tx("候车", "Waiting")}</small>
             <strong>{stats.waiting}</strong>
-          </span>
+          </button>
           <span>
             <Footprints size={14} />
             <small>{tx("已步行", "Walked")}</small>

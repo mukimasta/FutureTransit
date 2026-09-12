@@ -51,7 +51,7 @@ function pod(id: string, berthId: string): Pod {
 
 function schedulerWorld(berths: Berth[], tracks: Track[], pods: Pod[]): World {
   return {
-    version: 1,
+    version: 2,
     seed: 1,
     rng: 1,
     time: 0,

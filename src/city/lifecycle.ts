@@ -1,10 +1,7 @@
-import {
-  GROWTH_GRANT,
-  MAX_BUILDINGS,
-  MAX_RESIDENTS,
-} from "../shared/constants";
+import { MAX_BUILDINGS, MAX_RESIDENTS } from "../shared/constants";
 import {
   activeCapacity,
+  assignmentCapacity,
   availableJobSlots,
   buildingCapacity,
 } from "../shared/development";
@@ -52,6 +49,30 @@ const BUILDING_NAMES: Record<BuildingKind, readonly [string, string][]> = {
     ["桥边市集", "Bridge Market"],
     ["南街商场", "South Street Shops"],
   ],
+  school: [
+    ["青岚学园", "Blue Hill School"],
+    ["河湾学校", "Riverbend School"],
+    ["新桥书院", "Newbridge Academy"],
+    ["星野学园", "Starfield School"],
+  ],
+  hospital: [
+    ["安澜医院", "Harbor Hospital"],
+    ["青木诊疗中心", "Juniper Medical Center"],
+    ["新桥医院", "Newbridge Hospital"],
+    ["南岸健康中心", "Southbank Health Center"],
+  ],
+  restaurant: [
+    ["小满餐厅", "Little Harvest"],
+    ["晴川食堂", "Clearwater Kitchen"],
+    ["晚风餐馆", "Evening Table"],
+    ["桥边饭店", "Bridge Café"],
+  ],
+  park: [
+    ["青风公园", "Green Breeze Park"],
+    ["河湾公园", "Riverbend Park"],
+    ["星野花园", "Starfield Garden"],
+    ["南岸绿地", "Southbank Green"],
+  ],
 };
 
 function notice(
@@ -88,9 +109,22 @@ function nextDevelopmentAt(world: World): number {
 
 function baseCapacity(building: Pick<Building, "kind" | "w" | "h">) {
   const area = building.w * building.h;
-  if (building.kind === "office") return Math.max(96, area * 5);
-  if (building.kind === "shop") return Math.max(24, area * 2);
-  return Math.max(36, area * 3);
+  switch (building.kind) {
+    case "office":
+      return Math.max(96, area * 5);
+    case "school":
+      return Math.max(72, area * 4);
+    case "hospital":
+      return Math.max(60, area * 4);
+    case "restaurant":
+      return Math.max(28, area * 2);
+    case "park":
+      return Math.max(40, area * 3);
+    case "shop":
+      return Math.max(24, area * 2);
+    case "home":
+      return Math.max(36, area * 3);
+  }
 }
 
 function roleFor(
@@ -100,6 +134,8 @@ function roleFor(
   if (kind === "office" && (district <= 2 || district % 3 === 0))
     return "employment";
   if (kind === "shop" && (district <= 2 || district % 4 === 0))
+    return "commercial";
+  if (kind === "restaurant" && (district <= 2 || district % 4 === 0))
     return "commercial";
   return "local";
 }
@@ -136,6 +172,14 @@ function assignedCount(world: World, building: Building): number {
     return world.residents.filter((resident) => resident.homeId === building.id)
       .length;
   if (building.kind === "office")
+    return world.residents.filter((resident) => resident.workId === building.id)
+      .length;
+  if (
+    building.kind === "school" ||
+    building.kind === "hospital" ||
+    building.kind === "shop" ||
+    building.kind === "restaurant"
+  )
     return world.residents.filter((resident) => resident.workId === building.id)
       .length;
   return 0;
@@ -184,7 +228,7 @@ export function initializeCityGrowth(world: World): void {
           ? building.id === "b-office" || officeIndex++ % 4 === 0
             ? "employment"
             : "local"
-          : building.kind === "shop"
+          : building.kind === "shop" || building.kind === "restaurant"
             ? building.id === "b-shop" || shopIndex++ % 4 === 0
               ? "commercial"
               : "local"
@@ -382,7 +426,7 @@ function advanceOneBuilding(world: World): boolean {
       ? `${residents} new residents`
       : building.kind === "office"
         ? `${opened} new jobs`
-        : `${opened} new trading units`;
+        : `${opened} new activity places`;
   notice(
     world,
     `${building.name} 进入第 ${building.development.stage} 阶段，${change}。`,
@@ -443,13 +487,11 @@ function buildOneEvent(world: World): void {
     world.buildings.push(building);
   }
   for (const building of additions) {
-    if (building.kind === "office") newJobs += activeCapacity(building);
+    newJobs += assignmentCapacity(building);
     if (building.kind === "home") newResidents += admitToHome(world, building);
   }
 
   world.networkVersion += 1;
-  world.economy.pendingGrowthGrant =
-    (world.economy.pendingGrowthGrant ?? 0) + GROWTH_GRANT;
   world.growth.wave += 1;
   world.growth.nextKind = event === "expansion" ? "infill" : "expansion";
   world.growth.announced = false;
@@ -471,8 +513,8 @@ function buildOneEvent(world: World): void {
     additions.length > 2 ? `${names}等 ${additions.length} 栋建筑` : names;
   notice(
     world,
-    `${districtLabel} 启用第 1 阶段：新增 ${newResidents} 位居民、开放 ${newJobs} 个岗位；补助 ${GROWTH_GRANT} 待领取。`,
-    `${additions.length} buildings opened at stage 1: ${newResidents} residents, ${newJobs} jobs; ${GROWTH_GRANT} grant ready.`,
+    `${districtLabel} 启用第 1 阶段：新增 ${newResidents} 位居民、开放 ${newJobs} 个岗位。`,
+    `${additions.length} buildings opened at stage 1: ${newResidents} residents and ${newJobs} jobs.`,
     "success",
   );
 }

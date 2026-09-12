@@ -1,45 +1,46 @@
 import { describe, expect, it } from "vitest";
-import { updateEconomy, updateGrowth } from "../src/city";
+import { updateGrowth } from "../src/city";
 import { applyCommand, createWorld } from "../src/simulation";
-import { parseWorld, serializeWorld } from "../src/persistence";
+import {
+  CITY_DAY_SECONDS,
+  GOVERNMENT_GRANT_AMOUNT,
+  GOVERNMENT_GRANTS,
+  INITIAL_CASH,
+} from "../src/economy/config";
 
 describe("manual grants", () => {
-  it("keeps only one construction installment and rejects duplicate claims", () => {
-    const w = createWorld();
-    w.time = 7200;
-    updateEconomy(w, 7200);
-    expect(w.economy.cash).toBe(1900);
-    expect(w.economy.pendingGrant).toBe(280);
-    expect(w.economy.subsidy).toBe(0);
-    expect(applyCommand(w, { type: "claim-grant" }).ok).toBe(true);
-    expect(w.economy.cash).toBe(2180);
-    expect(w.economy.subsidy).toBe(280);
-    expect(applyCommand(w, { type: "claim-grant" }).ok).toBe(false);
-    updateEconomy(w, 1);
-    expect(w.economy.cash).toBe(2180);
-    expect(w.economy.pendingGrant).toBe(0);
+  it("pays exactly three immediate fixed grants and then rejects further claims", () => {
+    const world = createWorld();
+    for (let index = 0; index < GOVERNMENT_GRANTS; index += 1) {
+      expect(applyCommand(world, { type: "claim-grant" }).ok).toBe(true);
+      expect(world.economy.grantsClaimed).toBe(index + 1);
+    }
+    expect(world.economy.cash).toBe(
+      INITIAL_CASH + GOVERNMENT_GRANTS * GOVERNMENT_GRANT_AMOUNT,
+    );
+    expect(world.economy.subsidy).toBe(
+      GOVERNMENT_GRANTS * GOVERNMENT_GRANT_AMOUNT,
+    );
+    expect(applyCommand(world, { type: "claim-grant" }).ok).toBe(false);
   });
 
-  it("preserves pending grants through saves and accepts older saves", () => {
-    const w = createWorld();
-    expect(() => parseWorld(serializeWorld(w))).not.toThrow();
-    w.time = w.growth.nextAt;
-    updateGrowth(w);
-    updateEconomy(w, w.time);
-    const loaded = parseWorld(serializeWorld(w));
-    expect(loaded.economy.cash).toBe(1900);
-    expect(loaded.economy.pendingGrowthGrant).toBe(900);
-    applyCommand(loaded, { type: "claim-grant" });
-    expect(loaded.economy.cash).toBe(3080);
-    expect(loaded.economy.pendingGrowthGrant).toBe(0);
+  it("does not create a new grant from elapsed time or city growth", () => {
+    const world = createWorld();
+    world.time = world.growth.nextAt;
+    updateGrowth(world);
+    expect(world.economy.cash).toBe(INITIAL_CASH);
+    expect(world.economy.grantsClaimed).toBe(0);
+
+    world.time += CITY_DAY_SECONDS * 100;
+    expect(applyCommand(world, { type: "claim-grant" }).ok).toBe(true);
+    expect(world.economy.cash).toBe(INITIAL_CASH + GOVERNMENT_GRANT_AMOUNT);
   });
 
-  it("does not offer construction grants above the balance threshold", () => {
-    const w = createWorld();
-    w.economy.cash = 3000;
-    w.time = 1800;
-    updateEconomy(w, 1800);
-    expect(w.economy.pendingGrant ?? 0).toBe(0);
-    expect(applyCommand(w, { type: "claim-grant" }).ok).toBe(false);
+  it("starts directly in the version-2 economy; no legacy grant migration is required", () => {
+    const world = createWorld();
+    expect(world.version).toBe(2);
+    expect(world.economy.model).toBe(2);
+    expect(world.economy.pendingGrant).toBeUndefined();
+    expect(world.economy.pendingGrowthGrant).toBeUndefined();
   });
 });

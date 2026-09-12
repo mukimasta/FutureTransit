@@ -3,6 +3,7 @@ import { edgeKey, movementResources } from "../src/network";
 import { parseWorld, serializeWorld } from "../src/persistence";
 import { commitPlan, planRelocation } from "../src/scheduler";
 import { requiredTrajectoryWindows } from "../src/shared/trajectory";
+import { createEconomy } from "../src/economy";
 import type {
   Berth,
   MotionSegment,
@@ -38,7 +39,7 @@ function pod(id: string, berthId: string): Pod {
 
 function bareWorld(berths: Berth[], tracks: Track[], pods: Pod[]): World {
   return {
-    version: 1,
+    version: 2,
     seed: 1,
     rng: 1,
     time: 0,
@@ -325,6 +326,18 @@ describe("bidirectionally shared physical lanes", () => {
 });
 
 function addValidBuildings(world: World) {
+  world.economy = createEconomy(world.time);
+  for (const parking of world.berths) {
+    delete parking.buildingId;
+  }
+  world.berths.push({
+    id: "fixture-platform",
+    kind: "platform",
+    side: "east",
+    paid: 0,
+    point: { x: 10, y: 15 },
+    access: { x: 11, y: 15 },
+  });
   world.buildings = [
     {
       id: "b-home",

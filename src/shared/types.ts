@@ -3,7 +3,14 @@ export interface Point {
   y: number;
 }
 export type Language = "zh" | "en";
-export type BuildingKind = "home" | "office" | "shop";
+export type BuildingKind =
+  | "home"
+  | "office"
+  | "shop"
+  | "school"
+  | "hospital"
+  | "restaurant"
+  | "park";
 export type Side = "north" | "east" | "south" | "west";
 export interface BuildingDevelopment {
   /** Residents at home, jobs at offices, operating units at shops. */
@@ -30,7 +37,8 @@ export interface Building {
 }
 export interface Berth {
   id: string;
-  buildingId: string;
+  /** Only attached passenger platforms have a building owner. */
+  buildingId?: string;
   kind: "platform" | "parking";
   point: Point;
   access: Point;
@@ -49,7 +57,40 @@ export interface Walk {
   start: number;
   end: number;
 }
-export type Purpose = "work" | "shop" | "visit" | "home";
+export type Purpose =
+  | "work"
+  | "shop"
+  | "visit"
+  | "home"
+  | "study"
+  | "care"
+  | "meal"
+  | "leisure";
+export type Occupation = "worker" | "student" | "teacher" | "medic" | "service";
+export interface TravelDecision {
+  at: number;
+  destinationId?: string;
+  mode: "walk" | "pod";
+  walkSeconds: number;
+  podSeconds?: number;
+  waitSeconds?: number;
+  rideSeconds?: number;
+  distanceKm?: number;
+  fare?: number;
+  farePerKm: number;
+  /** Stable personal preference plus one seeded draw per departure. */
+  preferenceSeconds: number;
+  reason:
+    | "faster"
+    | "short-walk"
+    | "price"
+    | "wait"
+    | "preference"
+    | "no-platform"
+    | "disconnected"
+    | "no-pod"
+    | "wait-abandoned";
+}
 export type WaitReason =
   | "no-platform"
   | "disconnected"
@@ -67,12 +108,17 @@ export interface Journey {
   mode: "walk" | "pod";
   stage: "direct" | "access" | "queue" | "onboard" | "egress";
   walk?: Walk;
+  /** Egress route fixed when dispatch commits, just like an active walking path. */
+  egressPath?: Point[];
   pickupId?: string;
   dropoffId?: string;
   podId?: string;
   eta?: number;
   waitReason?: WaitReason;
   waited?: number;
+  /** Rate for this trip; no quote, surcharge or empty approach charge. */
+  farePerKm?: number;
+  distanceKm?: number;
 }
 export interface Resident {
   id: string;
@@ -95,6 +141,9 @@ export interface Resident {
   journey: Journey | null;
   fareSensitivity: number;
   trips: number;
+  occupation?: Occupation;
+  podPreference?: number;
+  decision?: TravelDecision;
 }
 export interface Reservation {
   resource: string;
@@ -148,6 +197,45 @@ export interface TripRecord {
   endedAt: number;
   walkBaseline: number;
   waited: number;
+  distanceKm?: number;
+  farePerKm?: number;
+  fare?: number;
+}
+export type LedgerCategory =
+  | "opening"
+  | "fare"
+  | "grant"
+  | "loan"
+  | "repayment"
+  | "interest"
+  | "track-build"
+  | "platform-build"
+  | "parking-build"
+  | "pod-buy"
+  | "refund"
+  | "track-upkeep"
+  | "platform-upkeep"
+  | "parking-upkeep"
+  | "pod-upkeep"
+  | "loaded-running"
+  | "empty-running";
+export interface LedgerEntry {
+  at: number;
+  category: LedgerCategory;
+  /** Signed cash movement, credits positive and debits negative. */
+  amount: number;
+}
+export type UpkeepCategory =
+  | "track-upkeep"
+  | "platform-upkeep"
+  | "parking-upkeep"
+  | "pod-upkeep";
+export interface Loan {
+  principal: number;
+  remaining: number;
+  installment: number;
+  nextPaymentAt: number;
+  arrears: number;
 }
 export interface Economy {
   cash: number;
@@ -160,6 +248,16 @@ export interface Economy {
   /** Earned but not yet claimed. Optional for existing v1 saves. */
   pendingGrant?: number;
   pendingGrowthGrant?: number;
+  model?: 2;
+  farePerKm?: number;
+  grantsClaimed?: number;
+  ledger?: LedgerEntry[];
+  totals?: Partial<Record<LedgerCategory, number>>;
+  loan?: Loan | null;
+  /** Operating distance costs accrued since last minute's bill. */
+  runningAccrued?: { loaded: number; empty: number };
+  upkeepAccrued?: Partial<Record<UpkeepCategory, number>>;
+  distanceKm?: { loaded: number; empty: number };
 }
 export interface Metrics {
   served: number;
@@ -197,7 +295,7 @@ export type PendingEdit =
       targetLanes?: 2 | 3;
     };
 export interface World {
-  version: 1;
+  version: 2;
   seed: number;
   rng: number;
   time: number;
@@ -221,9 +319,16 @@ export interface World {
 }
 export type Command =
   | { type: "claim-grant" }
+  | { type: "set-fare"; value: number }
+  | { type: "take-loan" }
+  | { type: "repay-loan" }
   | { type: "pause"; value: boolean }
+  | { type: "toggle-pause" }
   | { type: "speed"; value: 1 | 2 | 4 }
   | { type: "build-track"; points: Point[] }
+  | { type: "add-platform"; buildingId?: string; point?: Point; side: Side }
+  | { type: "add-parking"; point: Point; side: Side }
+  | { type: "add-parking"; nearPlatformId: string; side: Side }
   | { type: "add-berth"; buildingId: string; kind: Berth["kind"]; side: Side }
   | { type: "remove-track"; id: string }
   | { type: "remove-tracks"; ids: string[] }
@@ -249,7 +354,7 @@ export interface SelectionModifiers {
   range?: boolean;
   single?: boolean;
 }
-export type Tool = "select" | "track" | "remove";
+export type Tool = "view" | "edit";
 export interface TrackDraft {
   edges: Track[];
   cost: number;

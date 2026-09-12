@@ -8,6 +8,18 @@ import {
 } from "../shared/constants";
 import { initializeCityGrowth } from "../city";
 import {
+  CITY_DAY_SECONDS,
+  GOVERNMENT_GRANTS,
+  GOVERNMENT_GRANT_AMOUNT,
+  LEDGER_CATEGORIES,
+  LEDGER_LIMIT,
+  LOAN_AMOUNT,
+  LOAN_TERM_DAYS,
+  MAX_FARE_PER_KM,
+  MIN_FARE_PER_KM,
+} from "../economy/config";
+import {
+  buildingDoor,
   canonicalMovementResources,
   corridorNodeResources,
   edgeKey,
@@ -22,7 +34,17 @@ import {
   requiredTrajectoryWindows,
 } from "../shared/trajectory";
 
-export const SAVE_KEY = "futuretransit-mvp-v1";
+export const SAVE_KEY = "futuretransit-mvp-stations-v3";
+const purposes = [
+  "work",
+  "shop",
+  "visit",
+  "home",
+  "study",
+  "care",
+  "meal",
+  "leisure",
+];
 const fail = (message: string): never => {
   throw new Error(`存档无效 / Invalid save: ${message}`);
 };
@@ -123,7 +145,7 @@ function rebuiltPlanReservations(
 }
 
 export function serializeWorld(world: World): string {
-  return JSON.stringify({ format: "futuretransit-mvp", version: 1, world });
+  return JSON.stringify({ format: "futuretransit-mvp", version: 2, world });
 }
 
 export function parseWorld(text: string): World {
@@ -134,13 +156,13 @@ export function parseWorld(text: string): World {
   const envelope: unknown = JSON.parse(text);
   object(envelope);
   check(
-    envelope.format === "futuretransit-mvp" && envelope.version === 1,
-    "unsupported version",
+    envelope.format === "futuretransit-mvp" && envelope.version === 2,
+    "此版本需要新建城市，不支持旧版存档 / This version needs a new city; old saves are not supported",
   );
   object(envelope.world);
   finiteTree(envelope.world);
   const w = envelope.world as unknown as World;
-  check(w.version === 1, "unsupported world");
+  check(w.version === 2, "unsupported world");
   number(w.time);
   number(w.seed);
   number(w.rng, 1, 4294967295);
@@ -197,7 +219,18 @@ export function parseWorld(text: string): World {
     point(b);
     string(b.name);
     string(b.nameEn);
-    check(["home", "office", "shop"].includes(b.kind), "building kind");
+    check(
+      [
+        "home",
+        "office",
+        "shop",
+        "school",
+        "hospital",
+        "restaurant",
+        "park",
+      ].includes(b.kind),
+      "building kind",
+    );
     number(b.w, 1, 12);
     number(b.h, 1, 12);
     check(
@@ -214,7 +247,7 @@ export function parseWorld(text: string): World {
       number(d.capacity, 1, MAX_RESIDENTS);
       number(d.nextAt);
       number(d.district, 0, 1_000_000);
-      number(d.shift, 0, 3 * 3600);
+      number(d.shift, 0, CITY_DAY_SECONDS);
       check(
         Number.isInteger(d.capacity) && Number.isInteger(d.district),
         "development capacity",
@@ -226,11 +259,12 @@ export function parseWorld(text: string): World {
         "building role",
       );
       check(
-        d.role !== "employment" || b.kind === "office",
+        d.role !== "employment" ||
+          ["office", "school", "hospital"].includes(b.kind),
         "employment center kind",
       );
       check(
-        d.role !== "commercial" || b.kind === "shop",
+        d.role !== "commercial" || ["shop", "restaurant"].includes(b.kind),
         "commercial center kind",
       );
     }
@@ -249,7 +283,17 @@ export function parseWorld(text: string): World {
     }
   const berthPositions = new Set<string>();
   for (const b of w.berths) {
-    check(buildingIds.has(b.buildingId), "berth building");
+    // The previous revision stored a station owner. It is no longer a runtime
+    // relationship; retain the physical bay and discard only that old metadata.
+    if ("platformId" in b) delete b.platformId;
+    if (b.kind === "platform") {
+      check(
+        b.buildingId === undefined || buildingIds.has(b.buildingId),
+        "platform building",
+      );
+    } else {
+      check(b.buildingId === undefined, "parking is independent of buildings");
+    }
     check(
       ["platform", "parking"].includes(b.kind) &&
         ["north", "east", "south", "west"].includes(b.side),
@@ -267,6 +311,11 @@ export function parseWorld(text: string): World {
     check(!berthPositions.has(nodeKey(b.point)), "overlapping berths");
     berthPositions.add(nodeKey(b.point));
   }
+  for (const b of w.berths)
+    check(
+      !berthPositions.has(nodeKey(b.access)),
+      "berth access blocked by another berth",
+    );
   const physicalTracks = new Set<string>();
   for (const t of w.tracks) {
     point(t.a);
@@ -617,9 +666,50 @@ export function parseWorld(text: string): World {
     );
     number(r.nextDeparture);
     number(r.fareSensitivity, 0, 1000);
+    if (r.occupation !== undefined)
+      check(
+        ["worker", "student", "teacher", "medic", "service"].includes(
+          r.occupation,
+        ),
+        "occupation",
+      );
+    if (r.podPreference !== undefined) number(r.podPreference, -1000, 1000);
+    if (r.decision !== undefined) {
+      const d = r.decision;
+      object(d);
+      number(d.at, 0, w.time);
+      if (d.destinationId !== undefined)
+        check(buildingIds.has(d.destinationId), "decision destination");
+      number(d.walkSeconds);
+      number(d.farePerKm, MIN_FARE_PER_KM, MAX_FARE_PER_KM);
+      number(d.preferenceSeconds, -2000, 2000);
+      check(["pod", "walk"].includes(d.mode), "decision mode");
+      check(
+        [
+          "faster",
+          "short-walk",
+          "price",
+          "wait",
+          "preference",
+          "no-platform",
+          "disconnected",
+          "no-pod",
+          "wait-abandoned",
+        ].includes(d.reason),
+        "decision reason",
+      );
+      for (const key of [
+        "podSeconds",
+        "waitSeconds",
+        "rideSeconds",
+        "distanceKm",
+        "fare",
+      ] as const)
+        if (d[key] !== undefined) number(d[key]);
+    }
     number(r.trips);
     check(
-      ["work", "shop", "visit", "home"].includes(r.purpose) &&
+      purposes.includes(r.purpose) &&
         [
           "inside",
           "walking",
@@ -649,13 +739,33 @@ export function parseWorld(text: string): World {
         ["direct", "access", "queue", "onboard", "egress"].includes(j.stage),
       "journey mode",
     );
-    check(
-      ["work", "shop", "visit", "home"].includes(j.purpose),
-      "journey purpose",
-    );
+    check(purposes.includes(j.purpose), "journey purpose");
     if (r.status === "walking") check(j.walk, "walking without path");
     if (j.eta !== undefined) number(j.eta);
     if (j.waited !== undefined) number(j.waited);
+    if (j.farePerKm !== undefined)
+      number(j.farePerKm, MIN_FARE_PER_KM, MAX_FARE_PER_KM);
+    if (j.distanceKm !== undefined) number(j.distanceKm);
+    if (j.egressPath !== undefined) {
+      array(j.egressPath, 6000);
+      check(j.egressPath.length > 0, "empty egress route");
+      j.egressPath.forEach((p) => point(p));
+      for (let i = 1; i < j.egressPath.length; i++)
+        check(
+          distance(j.egressPath[i - 1], j.egressPath[i]) <= Math.SQRT2 + 1e-8,
+          "egress teleport",
+        );
+      const dropoff = w.berths.find((b) => b.id === j.dropoffId);
+      check(
+        dropoff && samePoint(dropoff.point, j.egressPath[0]),
+        "egress station",
+      );
+      const destination = w.buildings.find((b) => b.id === j.destinationId)!;
+      check(
+        samePoint(buildingDoor(destination), j.egressPath.at(-1)!),
+        "egress destination",
+      );
+    }
     if (j.walk) {
       array(j.walk.path, 6000);
       check(j.walk.path.length > 0, "empty walking path");
@@ -668,8 +778,42 @@ export function parseWorld(text: string): World {
           "walking teleport",
         );
     }
-    if (j.pickupId) check(berthIds.has(j.pickupId), "missing pickup");
-    if (j.dropoffId) check(berthIds.has(j.dropoffId), "missing dropoff");
+    if (j.pickupId)
+      check(
+        w.berths.some((b) => b.id === j.pickupId && b.kind === "platform"),
+        "missing pickup platform",
+      );
+    if (j.dropoffId)
+      check(
+        w.berths.some((b) => b.id === j.dropoffId && b.kind === "platform"),
+        "missing dropoff platform",
+      );
+    if (j.mode === "pod") {
+      check(
+        j.pickupId &&
+          j.dropoffId &&
+          j.pickupId !== j.dropoffId &&
+          j.stage !== "direct",
+        "Pod journey stations",
+      );
+      if (j.stage === "access" || j.stage === "egress") {
+        check(
+          r.status === "walking" && j.walk && !j.podId,
+          "station walking phase",
+        );
+        const station = w.berths.find(
+          (b) => b.id === (j.stage === "access" ? j.pickupId : j.dropoffId),
+        )!;
+        const endpoint =
+          j.stage === "access" ? j.walk!.path.at(-1)! : j.walk!.path[0];
+        check(samePoint(endpoint, station.point), "station walking endpoint");
+        if (j.stage === "egress")
+          check(
+            j.distanceKm !== undefined && j.farePerKm !== undefined,
+            "egress loaded fare",
+          );
+      }
+    }
     if (j.podId) check(podIds.has(j.podId), "missing Pod");
     if (["boarding", "riding", "alighting"].includes(r.status))
       check(
@@ -678,18 +822,66 @@ export function parseWorld(text: string): World {
       );
   }
   object(w.economy);
-  if (w.economy.pendingGrant !== undefined)
-    check(
-      [0, 280].includes(w.economy.pendingGrant),
-      "pending construction grant",
+  check(w.economy.model === 2, "economy model");
+  number(w.economy.cash, -1e12);
+  number(w.economy.farePerKm, MIN_FARE_PER_KM, MAX_FARE_PER_KM);
+  number(w.economy.grantsClaimed, 0, GOVERNMENT_GRANTS);
+  check(Number.isInteger(w.economy.grantsClaimed), "grant count");
+  check(
+    w.economy.subsidy === w.economy.grantsClaimed! * GOVERNMENT_GRANT_AMOUNT,
+    "grant history",
+  );
+  array(w.economy.ledger, LEDGER_LIMIT);
+  for (const entry of w.economy.ledger!) {
+    object(entry);
+    number(entry.at, 0, w.time);
+    check(LEDGER_CATEGORIES.includes(entry.category), "ledger category");
+    number(entry.amount, -1e12);
+    const credit = ["opening", "fare", "grant", "loan", "refund"].includes(
+      entry.category,
     );
-  if (w.economy.pendingGrowthGrant !== undefined) {
-    number(w.economy.pendingGrowthGrant, 0, 1e9);
-    check(w.economy.pendingGrowthGrant % 900 === 0, "pending growth grant");
+    check(credit ? entry.amount > 0 : entry.amount < 0, "ledger sign");
   }
-  for (const value of Object.values(w.economy)) number(value);
+  object(w.economy.totals);
+  object(w.economy.upkeepAccrued);
+  for (const [category, value] of Object.entries(w.economy.upkeepAccrued!)) {
+    check(
+      [
+        "track-upkeep",
+        "platform-upkeep",
+        "parking-upkeep",
+        "pod-upkeep",
+      ].includes(category),
+      "upkeep category",
+    );
+    number(value, 0, 0.011);
+  }
+  for (const [category, value] of Object.entries(w.economy.totals!)) {
+    check(
+      (LEDGER_CATEGORIES as readonly string[]).includes(category),
+      "totals category",
+    );
+    number(value);
+  }
+  for (const field of ["runningAccrued", "distanceKm"] as const) {
+    object(w.economy[field]);
+    number(w.economy[field]!.loaded);
+    number(w.economy[field]!.empty);
+  }
+  if (w.economy.loan !== null) {
+    const loan = w.economy.loan;
+    object(loan);
+    check(loan!.principal === LOAN_AMOUNT, "loan principal");
+    check(
+      loan!.installment === LOAN_AMOUNT / LOAN_TERM_DAYS,
+      "loan installment",
+    );
+    number(loan!.remaining, 0.01, LOAN_AMOUNT);
+    number(loan!.arrears, 0, loan!.remaining);
+    number(loan!.nextPaymentAt, w.time, w.time + CITY_DAY_SECONDS);
+    check(w.economy.grantsClaimed === GOVERNMENT_GRANTS, "loan before grants");
+  }
   for (const key of [
-    "cash",
     "income",
     "maintenance",
     "subsidy",
@@ -716,6 +908,10 @@ export function parseWorld(text: string): World {
     number(t.endedAt, t.startedAt, w.time);
     number(t.walkBaseline);
     number(t.waited);
+    if (t.distanceKm !== undefined) number(t.distanceKm);
+    if (t.farePerKm !== undefined)
+      number(t.farePerKm, MIN_FARE_PER_KM, MAX_FARE_PER_KM);
+    if (t.fare !== undefined) number(t.fare);
   }
   object(w.growth);
   number(w.growth.wave, 0, 1_000_000);

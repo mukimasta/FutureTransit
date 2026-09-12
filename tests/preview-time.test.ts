@@ -25,12 +25,14 @@ describe("candidate track previews", () => {
     ).toBeTruthy();
   });
 });
-describe("ten-minute presentation clock", () => {
-  it("only rounds the display and preserves precise arrival timestamps", () => {
-    expect(TIME_SCALE * 30).toBe(600);
-    expect(formatClock(599, 10)).toBe("07:00");
-    expect(formatClock(600, 10)).toBe("07:10");
+describe("minute presentation clock", () => {
+  it("advances one displayed minute every two real seconds at 1x", () => {
+    expect(TIME_SCALE * 2).toBe(60);
+    expect(formatClock(59)).toBe("07:00");
+    expect(formatClock(60)).toBe("07:01");
     expect(formatClock(599)).toBe("07:09");
-    expect(formatClock(17 * 3600, 10)).toBe("00:00");
+    expect(formatClock(600)).toBe("07:10");
+    expect(formatClock(17 * 3600 - 1)).toBe("23:59");
+    expect(formatClock(17 * 3600)).toBe("00:00");
   });
 });

@@ -29,9 +29,11 @@ describe("atomic batch track demolition", () => {
   });
   it("rejects duplicate/stale/capacity-breaking batches without partial effects", () => {
     const w = createWorld();
+    // A Pod waiting on a platform still needs a reachable dedicated parking bay.
+    w.pods[0].berthId = w.berths.find(b => b.kind === "platform")!.id;
     const id = w.tracks[0].id;
     const before = serializeWorld(w);
-    for (const ids of [[id, id], [id, "missing"], [id, w.tracks[1].id], []]) {
+    for (const ids of [[id, id], [id, "missing"], w.tracks.map(t => t.id), []]) {
       expect(applyCommand(w, { type: "remove-tracks", ids }).ok).toBe(false);
       expect(serializeWorld(w)).toBe(before);
     }

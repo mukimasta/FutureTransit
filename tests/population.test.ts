@@ -42,7 +42,7 @@ const shop: Building = {
 
 function world(seed = 1234): World {
   return {
-    version: 1,
+    version: 2,
     seed,
     rng: seed,
     time: 0,

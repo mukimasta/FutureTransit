@@ -1,6 +1,17 @@
-import { activeCapacity, jobCounts } from "../shared/development";
+import {
+  activeCapacity,
+  assignmentCapacity,
+  jobCounts,
+  supportsOccupation,
+} from "../shared/development";
 import { distance, random } from "../shared/math";
-import type { Building, Resident, World } from "../shared/types";
+import type {
+  Building,
+  BuildingKind,
+  Occupation,
+  Resident,
+  World,
+} from "../shared/types";
 
 function weightedBuilding(
   world: World,
@@ -42,6 +53,52 @@ export function chooseWorkplace(
       return (free * attraction) / (1 + distance(home, building) / 80);
     },
   );
+}
+
+/** Selects a real, commissioned routine destination for one city role. */
+export function chooseRoutinePlace(
+  world: World,
+  home: Building,
+  occupation: Occupation,
+  counts = jobCounts(world),
+  excludeId?: string,
+): Building | null {
+  return weightedBuilding(
+    world,
+    world.buildings.filter(
+      (building) =>
+        building.id !== excludeId && supportsOccupation(building, occupation),
+    ),
+    (building) => {
+      const free = Math.max(
+        0,
+        assignmentCapacity(building) - (counts.get(building.id) ?? 0),
+      );
+      const roleAttraction =
+        occupation === "worker" && building.development?.role === "employment"
+          ? 4
+          : occupation === "service" &&
+              building.development?.role === "commercial"
+            ? 3
+            : 1;
+      return (free * roleAttraction) / (1 + distance(home, building) / 80);
+    },
+  );
+}
+
+export function buildingsWithRoom(
+  world: World,
+  kind: BuildingKind,
+): Building[] {
+  return world.buildings.filter((building) => {
+    if (building.kind !== kind) return false;
+    const present = world.residents.filter(
+      (resident) =>
+        resident.atBuildingId === building.id ||
+        resident.nextDestinationId === building.id,
+    ).length;
+    return present < activeCapacity(building);
+  });
 }
 
 /** This only selects existing buildings; it never invents customers or trips. */

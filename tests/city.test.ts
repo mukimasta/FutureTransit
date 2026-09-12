@@ -6,11 +6,12 @@ import {
   updateEconomy,
   updateGrowth,
 } from "../src/city";
+import { createEconomy } from "../src/economy";
 import type { World } from "../src/shared/types";
 
 function world(seed = 71): World {
   return {
-    version: 1,
+    version: 2,
     seed,
     rng: seed,
     time: 0,
@@ -26,15 +27,7 @@ function world(seed = 71): World {
     residents: [],
     pods: [],
     reservations: [],
-    economy: {
-      cash: 1900,
-      income: 0,
-      maintenance: 0,
-      subsidy: 0,
-      spent: 0,
-      nextGrantAt: 1800,
-      lastMaintenanceAt: 0,
-    },
+    economy: createEconomy(),
     metrics: {
       served: 0,
       walked: 0,
@@ -157,7 +150,7 @@ describe("city", () => {
     expect(state.growth.nextAt).toBeGreaterThanOrEqual(state.time + 600);
   });
 
-  it("settles grants and maintenance deterministically without consuming construction cash beyond fare allowance", () => {
+  it("settles actual upkeep deterministically, including when cash becomes negative", () => {
     const a = world();
     const b = world();
     for (const state of [a, b]) {
@@ -167,19 +160,35 @@ describe("city", () => {
         b: { x: 2, y: 1 },
         paid: 3000,
       });
-      state.economy.cash = 100;
+      state.berths.push({
+        id: "platform",
+        buildingId: state.buildings[0]!.id,
+        kind: "platform",
+        point: { x: 1, y: 1 },
+        access: { x: 1, y: 2 },
+        side: "north",
+        paid: 0,
+      });
+      state.pods.push({
+        id: "pod",
+        berthId: "platform",
+        parkedSince: 0,
+        plan: null,
+        trips: 0,
+        paid: 0,
+      });
+      state.economy.cash = 1;
       state.time = 1800;
       updateEconomy(state, 1800);
     }
     expect(a.economy).toEqual(b.economy);
-    expect(a.economy.cash).toBe(100);
-    expect(a.economy.maintenance).toBe(0);
+    expect(a.economy.cash).toBeLessThan(0);
+    expect(a.economy.maintenance).toBeGreaterThan(0);
     expect(a.economy.subsidy).toBe(0);
-    expect(a.economy.pendingGrant).toBe(280);
-    a.economy.cash = 3100;
+    a.economy.cash = 10;
     a.time = 3600;
     updateEconomy(a, 1800);
-    expect(a.economy.nextGrantAt).toBe(5400);
+    expect(a.economy.cash).toBeLessThan(10);
   });
 
   it("records only actual Pod fare deliveries, preserves negative time savings, and bounds trip history", () => {
@@ -203,9 +212,11 @@ describe("city", () => {
       endedAt: 260,
       walkBaseline: 100,
       waited: 4,
+      distanceKm: 1.25,
+      farePerKm: 18,
     });
-    expect(state.economy.income).toBe(4);
-    expect(state.economy.cash).toBe(1904);
+    expect(state.economy.income).toBe(22.5);
+    expect(state.economy.cash).toBe(2622.5);
     expect(state.metrics.walked).toBe(1);
     expect(state.metrics.served).toBe(1);
     expect(state.metrics.savedSeconds).toBe(10);

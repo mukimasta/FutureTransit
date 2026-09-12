@@ -115,7 +115,10 @@ describe("complete city simulation", () => {
     }
     expect(sawEmpty && sawBoard && sawRide).toBe(true);
     expect(w.metrics.served).toBeGreaterThan(3);
-    expect(w.economy.income).toBe(w.metrics.served * 4);
+    expect(w.economy.income).toBeCloseTo(
+      w.metrics.recentTrips.reduce((sum, trip) => sum + (trip.fare ?? 0), 0),
+      2,
+    );
     expect(
       w.metrics.recentTrips
         .filter((t) => t.mode === "pod")
