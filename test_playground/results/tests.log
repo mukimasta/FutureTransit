@@ -1,0 +1,18 @@
+Using CPython 3.12.12
+Creating virtual environment at: .venv
+test_all_building_pairs_connected_and_hierarchical (test_simulator.SchedulingTests.test_all_building_pairs_connected_and_hierarchical) ... ok
+test_auditor_catches_injected_same_resource_collision (test_simulator.SchedulingTests.test_auditor_catches_injected_same_resource_collision) ... ok
+test_auditor_catches_opposite_direction_collision (test_simulator.SchedulingTests.test_auditor_catches_opposite_direction_collision) ... ok
+test_auditor_catches_vehicle_teleport (test_simulator.SchedulingTests.test_auditor_catches_vehicle_teleport) ... ok
+test_deterministic_trajectories (test_simulator.SchedulingTests.test_deterministic_trajectories) ... ok
+test_half_open_boundary_and_clearance (test_simulator.SchedulingTests.test_half_open_boundary_and_clearance) ... ok
+test_invalid_inputs (test_simulator.SchedulingTests.test_invalid_inputs) ... ok
+test_no_partial_bookings_left_after_retry (test_simulator.SchedulingTests.test_no_partial_bookings_left_after_retry) ... ok
+test_no_unnecessary_global_serialization (test_simulator.SchedulingTests.test_no_unnecessary_global_serialization) ... ok
+test_repeated_fleet_scenarios_complete (test_simulator.SchedulingTests.test_repeated_fleet_scenarios_complete) ... ok
+test_seed_sweep (test_simulator.SchedulingTests.test_seed_sweep) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 1.640s
+
+OK

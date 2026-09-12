@@ -1,0 +1,235 @@
+t=     0s Pod 00 trip 000 DEPART wait=0s
+t=     0s Pod 00 trip 000 REQUEST B00 -> B06
+t=     0s Pod 01 trip 001 REQUEST B01 -> B03
+t=     0s Pod 02 trip 002 REQUEST B02 -> B07
+t=     0s Pod 03 trip 003 REQUEST B03 -> B00
+t=     0s Pod 04 trip 004 DEPART wait=0s
+t=     0s Pod 04 trip 004 REQUEST B04 -> B01
+t=     0s Pod 05 trip 005 REQUEST B05 -> B09
+t=     0s Pod 06 trip 006 REQUEST B06 -> B01
+t=     0s Pod 07 trip 007 REQUEST B07 -> B05
+t=     0s Pod 08 trip 008 REQUEST B08 -> B00
+t=     0s Pod 09 trip 009 REQUEST B09 -> B08
+t=     0s Pod 10 trip 010 REQUEST B00 -> B04
+t=     0s Pod 11 trip 011 REQUEST B01 -> B00
+t=     0s Pod 12 trip 012 REQUEST B02 -> B01
+t=     0s Pod 13 trip 013 REQUEST B03 -> B07
+t=     0s Pod 14 trip 014 REQUEST B04 -> B07
+t=     0s Pod 15 trip 015 REQUEST B05 -> B01
+t=     0s Pod 16 trip 016 REQUEST B06 -> B03
+t=     0s Pod 17 trip 017 REQUEST B07 -> B01
+t=     0s Pod 18 trip 018 REQUEST B08 -> B09
+t=     0s Pod 19 trip 019 DEPART wait=0s
+t=     0s Pod 19 trip 019 REQUEST B09 -> B06
+t=     0s Pod 20 trip 020 REQUEST B00 -> B01
+t=     0s Pod 21 trip 021 REQUEST B01 -> B02
+t=     0s Pod 22 trip 022 REQUEST B02 -> B04
+t=     0s Pod 23 trip 023 REQUEST B03 -> B00
+t=     0s Pod 24 trip 024 REQUEST B04 -> B07
+t=     0s Pod 25 trip 025 REQUEST B05 -> B00
+t=     0s Pod 26 trip 026 REQUEST B06 -> B03
+t=     0s Pod 27 trip 027 REQUEST B07 -> B00
+t=     0s Pod 28 trip 028 REQUEST B08 -> B09
+t=     0s Pod 29 trip 029 REQUEST B09 -> B02
+t=     2s Pod 00 trip 000 MOVE B00 -> S0 until=6
+t=     2s Pod 04 trip 004 MOVE B04 -> S2 until=6
+t=     2s Pod 19 trip 019 MOVE B09 -> S4 until=6
+t=     6s Pod 01 trip 001 DEPART wait=6s
+t=     6s Pod 02 trip 002 DEPART wait=6s
+t=     7s Pod 00 trip 000 MOVE S0 -> J0 until=12
+t=     7s Pod 04 trip 004 MOVE S2 -> J2 until=12
+t=     7s Pod 19 trip 019 MOVE S4 -> J4 until=12
+t=     8s Pod 01 trip 001 MOVE B01 -> S0 until=12
+t=     8s Pod 02 trip 002 MOVE B02 -> S1 until=12
+t=    11s Pod 08 trip 008 DEPART wait=11s
+t=    11s Pod 11 trip 011 DEPART wait=11s
+t=    13s Pod 00 trip 000 MOVE J0 -> J4 until=21
+t=    13s Pod 01 trip 001 MOVE S0 -> J0 until=18
+t=    13s Pod 02 trip 002 MOVE S1 -> J1 until=18
+t=    13s Pod 04 trip 004 MOVE J2 -> J0 until=23
+t=    13s Pod 08 trip 008 MOVE B08 -> S4 until=17
+t=    13s Pod 09 trip 009 DEPART wait=13s
+t=    13s Pod 11 trip 011 MOVE B01 -> S0 until=17
+t=    13s Pod 19 trip 019 MOVE J4 -> J3 until=21
+t=    15s Pod 09 trip 009 MOVE B09 -> S4 until=19
+t=    17s Pod 15 trip 015 DEPART wait=17s
+t=    18s Pod 08 trip 008 MOVE S4 -> J4 until=23
+t=    18s Pod 11 trip 011 MOVE S0 -> B00 until=22
+t=    19s Pod 01 trip 001 MOVE J0 -> J1 until=27
+t=    19s Pod 02 trip 002 MOVE J1 -> J2 until=27
+t=    19s Pod 15 trip 015 MOVE B05 -> S2 until=23
+t=    20s Pod 09 trip 009 MOVE S4 -> B08 until=24
+t=    22s Pod 00 trip 000 MOVE J4 -> J3 until=30
+t=    22s Pod 19 trip 019 MOVE J3 -> S3 until=27
+t=    24s Pod 04 trip 004 MOVE J0 -> S0 until=29
+t=    24s Pod 05 trip 005 DEPART wait=24s
+t=    24s Pod 08 trip 008 MOVE J4 -> J0 until=32
+t=    24s Pod 11 trip 011 ARRIVE B00
+t=    24s Pod 15 trip 015 MOVE S2 -> J2 until=29
+t=    26s Pod 05 trip 005 MOVE B05 -> S2 until=30
+t=    26s Pod 09 trip 009 ARRIVE B08
+t=    27s Pod 18 trip 018 DEPART wait=27s
+t=    28s Pod 01 trip 001 MOVE J1 -> S1 until=33
+t=    28s Pod 02 trip 002 MOVE J2 -> J3 until=36
+t=    28s Pod 19 trip 019 MOVE S3 -> B06 until=32
+t=    28s Pod 20 trip 020 DEPART wait=28s
+t=    29s Pod 12 trip 012 DEPART wait=29s
+t=    29s Pod 18 trip 018 MOVE B08 -> S4 until=33
+t=    30s Pod 04 trip 004 MOVE S0 -> B01 until=34
+t=    30s Pod 15 trip 015 MOVE J2 -> J0 until=40
+t=    30s Pod 20 trip 020 MOVE B00 -> S0 until=34
+t=    31s Pod 00 trip 000 MOVE J3 -> S3 until=36
+t=    31s Pod 05 trip 005 MOVE S2 -> J2 until=36
+t=    31s Pod 12 trip 012 MOVE B02 -> S1 until=35
+t=    32s Pod 28 trip 028 DEPART wait=32s
+t=    33s Pod 08 trip 008 MOVE J0 -> S0 until=38
+t=    33s Pod 25 trip 025 DEPART wait=33s
+t=    34s Pod 01 trip 001 MOVE S1 -> B03 until=38
+t=    34s Pod 18 trip 018 MOVE S4 -> B09 until=38
+t=    34s Pod 19 trip 019 ARRIVE B06
+t=    34s Pod 28 trip 028 MOVE B08 -> S4 until=38
+t=    35s Pod 20 trip 020 MOVE S0 -> B01 until=39
+t=    35s Pod 22 trip 022 DEPART wait=35s
+t=    35s Pod 25 trip 025 MOVE B05 -> S2 until=39
+t=    36s Pod 04 trip 004 ARRIVE B01
+t=    36s Pod 12 trip 012 MOVE S1 -> J1 until=41
+t=    37s Pod 00 trip 000 MOVE S3 -> B06 until=41
+t=    37s Pod 02 trip 002 MOVE J3 -> S3 until=42
+t=    37s Pod 05 trip 005 MOVE J2 -> J3 until=45
+t=    37s Pod 22 trip 022 MOVE B02 -> S1 until=41
+t=    39s Pod 08 trip 008 MOVE S0 -> B00 until=43
+t=    39s Pod 28 trip 028 MOVE S4 -> B09 until=43
+t=    40s Pod 01 trip 001 ARRIVE B03
+t=    40s Pod 18 trip 018 ARRIVE B09
+t=    40s Pod 25 trip 025 MOVE S2 -> J2 until=45
+t=    41s Pod 03 trip 003 DEPART wait=41s
+t=    41s Pod 15 trip 015 MOVE J0 -> S0 until=46
+t=    41s Pod 20 trip 020 ARRIVE B01
+t=    42s Pod 12 trip 012 MOVE J1 -> J0 until=50
+t=    42s Pod 22 trip 022 MOVE S1 -> J1 until=47
+t=    43s Pod 00 trip 000 ARRIVE B06
+t=    43s Pod 02 trip 002 MOVE S3 -> B07 until=47
+t=    43s Pod 03 trip 003 MOVE B03 -> S1 until=47
+t=    44s Pod 06 trip 006 DEPART wait=44s
+t=    45s Pod 08 trip 008 ARRIVE B00
+t=    45s Pod 28 trip 028 ARRIVE B09
+t=    46s Pod 05 trip 005 MOVE J3 -> J4 until=54
+t=    46s Pod 06 trip 006 MOVE B06 -> S3 until=50
+t=    46s Pod 25 trip 025 MOVE J2 -> J0 until=56
+t=    47s Pod 15 trip 015 MOVE S0 -> B01 until=51
+t=    48s Pod 03 trip 003 MOVE S1 -> J1 until=53
+t=    48s Pod 22 trip 022 MOVE J1 -> J2 until=56
+t=    49s Pod 02 trip 002 ARRIVE B07
+t=    50s Pod 07 trip 007 DEPART wait=50s
+t=    51s Pod 06 trip 006 MOVE S3 -> J3 until=56
+t=    51s Pod 12 trip 012 MOVE J0 -> S0 until=56
+t=    52s Pod 07 trip 007 MOVE B07 -> S3 until=56
+t=    52s Pod 13 trip 013 DEPART wait=52s
+t=    53s Pod 15 trip 015 ARRIVE B01
+t=    54s Pod 03 trip 003 MOVE J1 -> J0 until=62
+t=    54s Pod 13 trip 013 MOVE B03 -> S1 until=58
+t=    55s Pod 05 trip 005 MOVE J4 -> S4 until=60
+t=    57s Pod 06 trip 006 MOVE J3 -> J4 until=65
+t=    57s Pod 07 trip 007 MOVE S3 -> J3 until=62
+t=    57s Pod 12 trip 012 MOVE S0 -> B01 until=61
+t=    57s Pod 22 trip 022 MOVE J2 -> S2 until=62
+t=    57s Pod 25 trip 025 MOVE J0 -> S0 until=62
+t=    59s Pod 13 trip 013 MOVE S1 -> J1 until=64
+t=    60s Pod 17 trip 017 DEPART wait=60s
+t=    61s Pod 05 trip 005 MOVE S4 -> B09 until=65
+t=    62s Pod 17 trip 017 MOVE B07 -> S3 until=66
+t=    63s Pod 03 trip 003 MOVE J0 -> S0 until=68
+t=    63s Pod 07 trip 007 MOVE J3 -> J2 until=71
+t=    63s Pod 12 trip 012 ARRIVE B01
+t=    63s Pod 22 trip 022 MOVE S2 -> B04 until=67
+t=    63s Pod 25 trip 025 MOVE S0 -> B00 until=67
+t=    65s Pod 13 trip 013 MOVE J1 -> J2 until=73
+t=    66s Pod 06 trip 006 MOVE J4 -> J0 until=74
+t=    67s Pod 05 trip 005 ARRIVE B09
+t=    67s Pod 17 trip 017 MOVE S3 -> J3 until=72
+t=    69s Pod 03 trip 003 MOVE S0 -> B00 until=73
+t=    69s Pod 22 trip 022 ARRIVE B04
+t=    69s Pod 25 trip 025 ARRIVE B00
+t=    72s Pod 07 trip 007 MOVE J2 -> S2 until=77
+t=    73s Pod 14 trip 014 DEPART wait=73s
+t=    73s Pod 17 trip 017 MOVE J3 -> J4 until=81
+t=    74s Pod 13 trip 013 MOVE J2 -> J3 until=82
+t=    75s Pod 03 trip 003 ARRIVE B00
+t=    75s Pod 06 trip 006 MOVE J0 -> S0 until=80
+t=    75s Pod 14 trip 014 MOVE B04 -> S2 until=79
+t=    75s Pod 23 trip 023 DEPART wait=75s
+t=    76s Pod 10 trip 010 DEPART wait=76s
+t=    77s Pod 23 trip 023 MOVE B03 -> S1 until=81
+t=    78s Pod 07 trip 007 MOVE S2 -> B05 until=82
+t=    78s Pod 10 trip 010 MOVE B00 -> S0 until=82
+t=    78s Pod 29 trip 029 DEPART wait=78s
+t=    80s Pod 14 trip 014 MOVE S2 -> J2 until=85
+t=    80s Pod 29 trip 029 MOVE B09 -> S4 until=84
+t=    81s Pod 06 trip 006 MOVE S0 -> B01 until=85
+t=    82s Pod 17 trip 017 MOVE J4 -> J0 until=90
+t=    82s Pod 23 trip 023 MOVE S1 -> J1 until=87
+t=    83s Pod 10 trip 010 MOVE S0 -> J0 until=88
+t=    83s Pod 13 trip 013 MOVE J3 -> S3 until=88
+t=    84s Pod 07 trip 007 ARRIVE B05
+t=    85s Pod 29 trip 029 MOVE S4 -> J4 until=90
+t=    86s Pod 14 trip 014 MOVE J2 -> J3 until=94
+t=    87s Pod 06 trip 006 ARRIVE B01
+t=    88s Pod 23 trip 023 MOVE J1 -> J0 until=96
+t=    89s Pod 10 trip 010 MOVE J0 -> J2 until=99
+t=    89s Pod 13 trip 013 MOVE S3 -> B07 until=93
+t=    91s Pod 17 trip 017 MOVE J0 -> S0 until=96
+t=    91s Pod 29 trip 029 MOVE J4 -> J0 until=99
+t=    95s Pod 13 trip 013 ARRIVE B07
+t=    95s Pod 14 trip 014 MOVE J3 -> S3 until=100
+t=    96s Pod 16 trip 016 DEPART wait=96s
+t=    97s Pod 17 trip 017 MOVE S0 -> B01 until=101
+t=    97s Pod 23 trip 023 MOVE J0 -> S0 until=102
+t=    98s Pod 16 trip 016 MOVE B06 -> S3 until=102
+t=   100s Pod 10 trip 010 MOVE J2 -> S2 until=105
+t=   100s Pod 29 trip 029 MOVE J0 -> J1 until=108
+t=   101s Pod 14 trip 014 MOVE S3 -> B07 until=105
+t=   103s Pod 16 trip 016 MOVE S3 -> J3 until=108
+t=   103s Pod 17 trip 017 ARRIVE B01
+t=   103s Pod 23 trip 023 MOVE S0 -> B00 until=107
+t=   106s Pod 10 trip 010 MOVE S2 -> B04 until=110
+t=   107s Pod 14 trip 014 ARRIVE B07
+t=   108s Pod 27 trip 027 DEPART wait=108s
+t=   109s Pod 16 trip 016 MOVE J3 -> J2 until=117
+t=   109s Pod 23 trip 023 ARRIVE B00
+t=   109s Pod 29 trip 029 MOVE J1 -> S1 until=114
+t=   110s Pod 27 trip 027 MOVE B07 -> S3 until=114
+t=   111s Pod 21 trip 021 DEPART wait=111s
+t=   112s Pod 10 trip 010 ARRIVE B04
+t=   113s Pod 21 trip 021 MOVE B01 -> S0 until=117
+t=   113s Pod 24 trip 024 DEPART wait=113s
+t=   115s Pod 24 trip 024 MOVE B04 -> S2 until=119
+t=   115s Pod 27 trip 027 MOVE S3 -> J3 until=120
+t=   115s Pod 29 trip 029 MOVE S1 -> B02 until=119
+t=   118s Pod 16 trip 016 MOVE J2 -> J1 until=126
+t=   118s Pod 21 trip 021 MOVE S0 -> J0 until=123
+t=   120s Pod 24 trip 024 MOVE S2 -> J2 until=125
+t=   121s Pod 27 trip 027 MOVE J3 -> J4 until=129
+t=   121s Pod 29 trip 029 ARRIVE B02
+t=   124s Pod 21 trip 021 MOVE J0 -> J1 until=132
+t=   126s Pod 24 trip 024 MOVE J2 -> J3 until=134
+t=   127s Pod 16 trip 016 MOVE J1 -> S1 until=132
+t=   130s Pod 27 trip 027 MOVE J4 -> J0 until=138
+t=   133s Pod 16 trip 016 MOVE S1 -> B03 until=137
+t=   133s Pod 21 trip 021 MOVE J1 -> S1 until=138
+t=   135s Pod 24 trip 024 MOVE J3 -> S3 until=140
+t=   136s Pod 26 trip 026 DEPART wait=136s
+t=   138s Pod 26 trip 026 MOVE B06 -> S3 until=142
+t=   139s Pod 16 trip 016 ARRIVE B03
+t=   139s Pod 21 trip 021 MOVE S1 -> B02 until=143
+t=   139s Pod 27 trip 027 MOVE J0 -> S0 until=144
+t=   141s Pod 24 trip 024 MOVE S3 -> B07 until=145
+t=   143s Pod 26 trip 026 MOVE S3 -> J3 until=148
+t=   145s Pod 21 trip 021 ARRIVE B02
+t=   145s Pod 27 trip 027 MOVE S0 -> B00 until=149
+t=   147s Pod 24 trip 024 ARRIVE B07
+t=   149s Pod 26 trip 026 MOVE J3 -> J2 until=157
+t=   151s Pod 27 trip 027 ARRIVE B00
+t=   158s Pod 26 trip 026 MOVE J2 -> J1 until=166
+t=   167s Pod 26 trip 026 MOVE J1 -> S1 until=172
+t=   173s Pod 26 trip 026 MOVE S1 -> B03 until=177
+t=   179s Pod 26 trip 026 ARRIVE B03
