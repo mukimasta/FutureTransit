@@ -1,9 +1,0 @@
-[project]
-name = "futuretransit-scheduling-prototype"
-version = "0.1.0"
-description = "Building-level Pod routing and atomic space-time reservation experiment"
-requires-python = ">=3.11"
-dependencies = []
-
-[tool.uv]
-package = false
