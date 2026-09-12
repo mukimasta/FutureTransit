@@ -2,6 +2,20 @@
 
 FutureTransit 是一个可玩的、双语的城市交通沙盒：居民会在建筑之间步行或乘坐 Pod，玩家铺设 8 方向网格轨道、配置平台与停车位，并观察有限容量下的真实接送。运行时由 React/SVG 界面、TypeScript 模拟和 Web Worker 组成；Worker 拥有唯一的 World 状态。
 
+它不是汽车模拟器，也不是地铁线路游戏：Pod 是共享的小型无人舱，运行在受控的专用网络中。乘客从出发楼到目的楼无需换乘；系统自动接送，你负责设计平台、路网和容量。城市逐渐长大，原本够用的设计会出现新的瓶颈。
+
+## 在线试玩
+
+[打开 FutureTransit](https://mukimasta.github.io/FutureTransit/) — 建议用电脑浏览器，无需安装或登录 GitHub。首次打开会显示中英双语介绍，之后可以在设置里重新查看。
+
+这是单人沙盒，每个人的城市独立保存在自己的浏览器中，不是在线联机或云存档。本地开发地址与线上地址的存档不互通；可在设置中导出 / 导入 JSON 来转移城市。
+
+### 自动发布
+
+向 `mvp` 分支推送后，GitHub Actions 自动构建并发布到 Pages，也可在 Actions 中手动运行 `Deploy game to GitHub Pages`。仓库 Settings → Pages 的 Source 使用 **GitHub Actions**。
+
+`npm run build:pages` 生成带 `/FutureTransit/` 路径的 `dist/`；本地开发仍使用 `npm run dev`，普通构建仍使用 `npm run build`。只上传构建产物，源码和开发依赖不会作为站点文件发布。若更换仓库名称，需要同步更新此命令的路径和试玩链接。
+
 ## 运行
 
 ```bash
@@ -41,6 +55,6 @@ npm test
 
 当前技术保护上限为 120 栋建筑、1,200 名逐人模拟居民、160 辆 Pod，地图边长最多 256 格；这不是已经验证的流畅满载承诺，也不宣称无限地图。达到保护边界会提示限制而非结束游戏。旧有限增长存档会保留实体与轨迹并继续发展；大城市自动保存失败时会提醒导出 JSON。
 
-旧版 Demo 与实验仍保留在 Git 的 `main` 和 `demo-v0.1` 中；本目录是新版 MVP。当前工作树的文档和实现尚未创建新的 Git 提交。
+旧版 Demo 与实验仍保留在本地 Git 的 `main` 和 `demo-v0.1` 中；本目录和线上试玩是 `mvp` 分支的新版 MVP。
 
 更多边界见 [实施契约](docs/IMPLEMENTATION_CONTRACT.md)、[验证记录](docs/VALIDATION.md) 和 [模块文档](docs/modules/)。

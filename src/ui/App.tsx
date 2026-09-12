@@ -33,7 +33,13 @@ import { useSimulation } from "../app/bridge";
 import { trackResources, findTrackPath, validateTrackDraft } from "../network";
 import { corridorTracks, trackRange } from "../network/selection";
 import { previewPoints } from "../network/preview";
-import { readGuideDismissed, rememberGuideDismissed } from "./preferences";
+import {
+  readGuideDismissed,
+  rememberGuideDismissed,
+  readIntroSeen,
+  rememberIntroSeen,
+} from "./preferences";
+import { Introduction } from "./Introduction";
 import {
   parkingGroups,
   parkingPurchaseShortage,
@@ -221,6 +227,7 @@ export default function App() {
   const [hoverPoint, setHoverPoint] = useState<Point | null>(null);
   const [side, setSide] = useState<Side>("east");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [introOpen, setIntroOpen] = useState(() => !readIntroSeen());
   const [guideOpen, setGuideOpen] = useState(true);
   const [guideDismissed, setGuideDismissed] = useState(readGuideDismissed);
   const [guideReplay, setGuideReplay] = useState(false);
@@ -365,6 +372,7 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (introOpen) return;
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -1639,6 +1647,17 @@ export default function App() {
               className="wide-action"
               type="button"
               onClick={() => {
+                send({ type: "pause", value: true });
+                setIntroOpen(true);
+                setSettingsOpen(false);
+              }}
+            >
+              {tx("这是什么游戏？", "What is FutureTransit?")}
+            </button>
+            <button
+              className="wide-action"
+              type="button"
+              onClick={() => {
                 setGuideDismissed(false);
                 setGuideReplay(true);
                 setGuideOpen(true);
@@ -2036,6 +2055,18 @@ export default function App() {
           </span>
         </div>
       </footer>
+      {introOpen && (
+        <Introduction
+          language={language}
+          onLanguageChange={() =>
+            setLanguage((current) => (current === "zh" ? "en" : "zh"))
+          }
+          onDismiss={() => {
+            rememberIntroSeen();
+            setIntroOpen(false);
+          }}
+        />
+      )}
     </main>
   );
 }
