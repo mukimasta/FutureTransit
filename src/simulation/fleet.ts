@@ -1,16 +1,17 @@
-import { pathLength, pointKey } from "../shared/math";
-import { findTrackPath } from "../network";
+import { pointKey } from "../shared/math";
+import { trackPathLength } from "../network";
 import type { Berth, Pod, World } from "../shared/types";
 
 export function reachableIdlePods(world: World, pickup: Berth): Pod[] {
+  const berthsById = new Map(world.berths.map((berth) => [berth.id, berth]));
   return world.pods
     .filter((p) => !p.plan && p.berthId)
     .flatMap((pod) => {
-      const origin = world.berths.find((b) => b.id === pod.berthId);
-      const path = origin
-        ? findTrackPath(world, origin.point, pickup.point)
+      const origin = berthsById.get(pod.berthId!);
+      const length = origin
+        ? trackPathLength(world, origin.point, pickup.point)
         : null;
-      return path ? [{ pod, length: pathLength(path) }] : [];
+      return length === null ? [] : [{ pod, length }];
     })
     .sort((a, b) => a.length - b.length || a.pod.id.localeCompare(b.pod.id))
     .map((entry) => entry.pod);

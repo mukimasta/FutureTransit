@@ -1,6 +1,7 @@
 import { TRACK_COST } from "../shared/constants";
-import { distance, samePoint } from "../shared/math";
+import { distance, pathTotalLength, samePoint } from "../shared/math";
 import type {
+  Berth,
   Building,
   Point,
   Track,
@@ -11,8 +12,13 @@ import type {
 const EPSILON = 1e-9;
 
 interface PathCache {
-  signature: string;
-  paths: Map<string, Point[] | null>;
+  networkVersion: number;
+  width: number;
+  height: number;
+  buildingCount: number;
+  berthCount: number;
+  trackCount: number;
+  paths: Map<number | string, Point[] | null>;
 }
 const pathCaches = new WeakMap<World, PathCache>();
 
@@ -21,18 +27,36 @@ interface ResourceConnection {
   track?: Track;
 }
 interface ResourceIndex {
-  stamp: string;
+  networkVersion: number;
+  trackCount: number;
+  berthCount: number;
   tracksByEdge: Map<string, Track>;
   connectionsByNode: Map<string, ResourceConnection[]>;
+  /** Derived, per-topology memos. Rebuilt whenever the stamp changes. */
+  berthsByPoint: Map<string, Berth>;
+  laneOptions: Map<string, string[][]>;
+  laneOptionsById: Map<number, string[][]>;
+  corridors: Map<string, LaneCorridor | null>;
+  nodeResources: Map<string, string[]>;
+  dwellResources: Map<string, string[]>;
+  trackGraph: Map<string, GraphEdge[]> | null;
 }
 const resourceIndexes = new WeakMap<World, ResourceIndex>();
 
 function resourceIndex(world: World): ResourceIndex {
-  const stamp = `${world.networkVersion}:${world.tracks.length}:${world.berths.length}`;
+  // Compared field by field: this runs on nearly every resource lookup, so it
+  // must not build a stamp string each time.
   const existing = resourceIndexes.get(world);
-  if (existing?.stamp === stamp) return existing;
+  if (
+    existing !== undefined &&
+    existing.networkVersion === world.networkVersion &&
+    existing.trackCount === world.tracks.length &&
+    existing.berthCount === world.berths.length
+  )
+    return existing;
   const tracksByEdge = new Map<string, Track>();
   const connectionsByNode = new Map<string, ResourceConnection[]>();
+  const berthsByPoint = new Map<string, Berth>();
   const connect = (a: Point, b: Point, track?: Track) => {
     const entries = connectionsByNode.get(nodeKey(a)) ?? [];
     entries.push({ point: b, track });
@@ -46,12 +70,110 @@ function resourceIndex(world: World): ResourceIndex {
   for (const berth of world.berths) {
     connect(berth.point, berth.access);
     connect(berth.access, berth.point);
+    const key = nodeKey(berth.point);
+    if (!berthsByPoint.has(key)) berthsByPoint.set(key, berth);
   }
-  const index = { stamp, tracksByEdge, connectionsByNode };
+  const index: ResourceIndex = {
+    networkVersion: world.networkVersion,
+    trackCount: world.tracks.length,
+    berthCount: world.berths.length,
+    tracksByEdge,
+    connectionsByNode,
+    berthsByPoint,
+    laneOptions: new Map(),
+    laneOptionsById: new Map(),
+    corridors: new Map(),
+    nodeResources: new Map(),
+    dwellResources: new Map(),
+    trackGraph: null,
+  };
   resourceIndexes.set(world, index);
   return index;
 }
-function cachedPath(
+
+/** Through-corridor geometry is not part of the index stamp, so edits to it
+ * must drop the memos derived from it. */
+function invalidateCorridors(world: World): void {
+  const index = resourceIndexes.get(world);
+  if (!index) return;
+  index.corridors.clear();
+  index.nodeResources.clear();
+  index.dwellResources.clear();
+}
+
+/** First berth standing on this grid point, without scanning the berth list. */
+export function berthAtPoint(world: World, point: Point): Berth | undefined {
+  return resourceIndex(world).berthsByPoint.get(nodeKey(point));
+}
+
+/** The track joining two adjacent points, without scanning the track list. */
+export function trackBetween(
+  world: World,
+  a: Point,
+  b: Point,
+): Track | undefined {
+  return resourceIndex(world).tracksByEdge.get(edgeKey(a, b));
+}
+/** An allocation-free cache key for in-bounds grid endpoints, which is all of
+ * them in practice; anything else falls back to a descriptive string. */
+function pathCacheKey(
+  world: World,
+  from: Point,
+  to: Point,
+  walking: boolean,
+): number | string {
+  const { width, height } = world;
+  const cells = width * height;
+  if (
+    Number.isInteger(from.x) &&
+    Number.isInteger(from.y) &&
+    Number.isInteger(to.x) &&
+    Number.isInteger(to.y) &&
+    from.x >= 0 &&
+    from.y >= 0 &&
+    to.x >= 0 &&
+    to.y >= 0 &&
+    from.x < width &&
+    from.y < height &&
+    to.x < width &&
+    to.y < height &&
+    cells * cells * 2 <= Number.MAX_SAFE_INTEGER
+  )
+    return (
+      ((from.y * width + from.x) * cells + (to.y * width + to.x)) * 2 +
+      (walking ? 1 : 0)
+    );
+  return `${walking ? "walk" : "track"}:${from.x},${from.y}:${to.x},${to.y}`;
+}
+
+/** A numeric, canonical id for an edge between two in-bounds grid points, or
+ * null when the endpoints leave the grid. Memo lookups keyed on it skip the
+ * string build and hash that `edgeKey` would cost on every movement query. */
+function edgeId(world: World, a: Point, b: Point): number | null {
+  const { width, height } = world;
+  const cells = width * height;
+  if (
+    !Number.isInteger(a.x) ||
+    !Number.isInteger(a.y) ||
+    !Number.isInteger(b.x) ||
+    !Number.isInteger(b.y) ||
+    a.x < 0 ||
+    a.y < 0 ||
+    b.x < 0 ||
+    b.y < 0 ||
+    a.x >= width ||
+    a.y >= height ||
+    b.x >= width ||
+    b.y >= height ||
+    cells * cells > Number.MAX_SAFE_INTEGER
+  )
+    return null;
+  const [first, second] = comparePoints(a, b) <= 0 ? [a, b] : [b, a];
+  return (first.y * width + first.x) * cells + (second.y * width + second.x);
+}
+
+/** The shared, cached route. Callers outside this module get their own copy. */
+function storedPath(
   world: World,
   from: Point,
   to: Point,
@@ -59,21 +181,48 @@ function cachedPath(
 ): Point[] | null {
   // All production topology edits increment networkVersion. Counts additionally
   // protect construction fixtures; direct coordinate edits must bump the version.
-  const signature = `${world.networkVersion}:${world.width},${world.height}:${world.buildings.length}:${world.berths.length}:${world.tracks.length}`;
   let cache = pathCaches.get(world);
-  if (!cache || cache.signature !== signature) {
-    cache = { signature, paths: new Map() };
+  if (
+    cache === undefined ||
+    cache.networkVersion !== world.networkVersion ||
+    cache.width !== world.width ||
+    cache.height !== world.height ||
+    cache.buildingCount !== world.buildings.length ||
+    cache.berthCount !== world.berths.length ||
+    cache.trackCount !== world.tracks.length
+  ) {
+    cache = {
+      networkVersion: world.networkVersion,
+      width: world.width,
+      height: world.height,
+      buildingCount: world.buildings.length,
+      berthCount: world.berths.length,
+      trackCount: world.tracks.length,
+      paths: new Map(),
+    };
     pathCaches.set(world, cache);
   }
-  const key = `${walking ? "walk" : "track"}:${from.x},${from.y}:${to.x},${to.y}`;
-  if (!cache.paths.has(key))
-    cache.paths.set(
-      key,
-      walking
-        ? computeWalkPath(world, from, to)
-        : computeTrackPath(world, from, to),
-    );
-  return cache.paths.get(key)?.map((p) => ({ ...p })) ?? null;
+  const key = pathCacheKey(world, from, to, walking);
+  const cached = cache.paths.get(key);
+  if (cached !== undefined) return cached;
+  const path = walking
+    ? computeWalkPath(world, from, to)
+    : computeTrackPath(world, from, to);
+  cache.paths.set(key, path);
+  return path;
+}
+function cachedPath(
+  world: World,
+  from: Point,
+  to: Point,
+  walking: boolean,
+): Point[] | null {
+  const path = storedPath(world, from, to, walking);
+  if (!path) return null;
+  const copy = new Array<Point>(path.length);
+  for (let index = 0; index < path.length; index += 1)
+    copy[index] = { x: path[index].x, y: path[index].y };
+  return copy;
 }
 export function findTrackPath(
   world: World,
@@ -88,6 +237,27 @@ export function findWalkPath(
   to: Point,
 ): Point[] | null {
   return cachedPath(world, from, to, true);
+}
+
+/**
+ * Grid length of the shortest route, or null when there is none. Planners that
+ * only rank routes never need a private copy of the point list.
+ */
+export function trackPathLength(
+  world: World,
+  from: Point,
+  to: Point,
+): number | null {
+  const path = storedPath(world, from, to, false);
+  return path ? pathTotalLength(path) : null;
+}
+export function walkPathLength(
+  world: World,
+  from: Point,
+  to: Point,
+): number | null {
+  const path = storedPath(world, from, to, true);
+  return path ? pathTotalLength(path) : null;
 }
 
 function isGridPoint(point: Point): boolean {
@@ -109,8 +279,9 @@ function canonicalPair(a: Point, b: Point): [Point, Point] {
 
 /** A direction-independent resource id for one physical track unit. */
 export function edgeKey(a: Point, b: Point): string {
-  const [first, second] = canonicalPair(a, b);
-  return `edge:${first.x},${first.y}~${second.x},${second.y}`;
+  return comparePoints(a, b) <= 0
+    ? `edge:${a.x},${a.y}~${b.x},${b.y}`
+    : `edge:${b.x},${b.y}~${a.x},${a.y}`;
 }
 
 /** A stable resource id for a network node. */
@@ -128,10 +299,6 @@ export function edgeResources(a: Point, b: Point): string[] {
     resources.push(`crossing:${a.x + b.x},${a.y + b.y}`);
   }
   return resources;
-}
-
-function trackAt(world: World, a: Point, b: Point): Track | undefined {
-  return resourceIndex(world).tracksByEdge.get(edgeKey(a, b));
 }
 
 const legacyDirectedLaneKey = (a: Point, b: Point) =>
@@ -153,7 +320,7 @@ function legacyCrossingChannels(a: Point, b: Point): string[] {
 }
 
 function trackLaneCount(world: World, a: Point, b: Point): 1 | 2 | 3 {
-  return trackAt(world, a, b)?.lanes ?? 1;
+  return trackBetween(world, a, b)?.lanes ?? 1;
 }
 
 /** A direction-independent resource id for one lane of a physical edge. */
@@ -188,17 +355,35 @@ function sameResourceSet(left: string[], right: string[]): boolean {
   );
 }
 
-/** Every legal physical-lane choice for this movement. */
+/**
+ * Every legal physical-lane choice for this movement. The result is memoized
+ * per topology, so callers must treat it as read-only.
+ */
 export function movementResourceOptions(
   world: World,
   a: Point,
   b: Point,
 ): string[][] {
-  const lanes = trackLaneCount(world, a, b);
-  return Array.from({ length: lanes }, (_, laneIndex) => [
-    lanes === 1 ? edgeKey(a, b) : laneKey(a, b, laneIndex),
+  const index = resourceIndex(world);
+  const id = edgeId(world, a, b);
+  if (id !== null) {
+    const hit = index.laneOptionsById.get(id);
+    if (hit) return hit;
+  }
+  const key = edgeKey(a, b);
+  const memo = index.laneOptions.get(key);
+  if (memo) {
+    if (id !== null) index.laneOptionsById.set(id, memo);
+    return memo;
+  }
+  const lanes = index.tracksByEdge.get(key)?.lanes ?? 1;
+  const options = Array.from({ length: lanes }, (_, laneIndex) => [
+    lanes === 1 ? key : `lane:${key.slice("edge:".length)}:${laneIndex}`,
     ...crossingSlotResources(a, b, laneIndex),
   ]);
+  index.laneOptions.set(key, options);
+  if (id !== null) index.laneOptionsById.set(id, options);
+  return options;
 }
 
 /**
@@ -218,7 +403,8 @@ export function movementResources(
     laneIndex >= options.length
   )
     throw new Error(`Illegal lane ${laneIndex} for ${edgeKey(a, b)}`);
-  return options[laneIndex];
+  // The memo is shared; hand every caller its own array to keep or mutate.
+  return [...options[laneIndex]];
 }
 
 /** Exact movement resources written by the former directional-lane format. */
@@ -280,6 +466,16 @@ interface LaneCorridor {
 }
 
 function laneCorridor(world: World, point: Point): LaneCorridor | null {
+  const index = resourceIndex(world);
+  const memoKey = nodeKey(point);
+  const memo = index.corridors.get(memoKey);
+  if (memo !== undefined) return memo;
+  const corridor = computeLaneCorridor(world, point);
+  index.corridors.set(memoKey, corridor);
+  return corridor;
+}
+
+function computeLaneCorridor(world: World, point: Point): LaneCorridor | null {
   const neighbors: { point: Point; lanes: 1 | 2 | 3 }[] = [];
   const add = (neighbor: Point, lanes: 1 | 2 | 3) => {
     const existing = neighbors.find((entry) =>
@@ -329,6 +525,16 @@ const legacyCorridorLaneKey = (point: Point, from: Point, to: Point) =>
 
 /** The shared node plus any legal physical-lane channels at this point. */
 export function corridorNodeResources(world: World, point: Point): string[] {
+  const index = resourceIndex(world);
+  const memoKey = nodeKey(point);
+  const memo = index.nodeResources.get(memoKey);
+  if (memo) return memo;
+  const resources = computeCorridorNodeResources(world, point);
+  index.nodeResources.set(memoKey, resources);
+  return resources;
+}
+
+function computeCorridorNodeResources(world: World, point: Point): string[] {
   const corridor = laneCorridor(world, point);
   if (!corridor) return [nodeKey(point)];
   return [
@@ -360,6 +566,28 @@ export function exclusiveNodeResources(world: World, point: Point): string[] {
     : [nodeKey(point)];
 }
 
+/**
+ * Everything a dwell at this point occupies: the berth resource, if any, plus
+ * every exclusive junction channel. Memoized with the corridor geometry it is
+ * derived from, because trajectories ask for the same points repeatedly.
+ */
+export function dwellResources(world: World, point: Point): string[] {
+  const index = resourceIndex(world);
+  const memoKey = nodeKey(point);
+  const memo = index.dwellResources.get(memoKey);
+  if (memo) return memo;
+  const berth = index.berthsByPoint.get(memoKey);
+  const resources = [
+    ...new Set([
+      memoKey,
+      ...(berth ? [`berth:${berth.id}`] : []),
+      ...exclusiveNodeResources(world, point),
+    ]),
+  ];
+  index.dwellResources.set(memoKey, resources);
+  return resources;
+}
+
 /** Preserve existing through geometry when new branches introduce a junction.
  * Old trains keep their lanes; new turning movements reserve all through lanes. */
 export function preserveThroughCorridors(before: World, after: World): void {
@@ -385,10 +613,12 @@ export function preserveThroughCorridors(before: World, after: World): void {
       });
   }
   after.throughCorridors = [...saved.values()];
+  invalidateCorridors(after);
 }
 
 /** Demolition still drains its junction first, then discards obsolete geometry. */
 export function pruneThroughCorridors(world: World): void {
+  const previous = world.throughCorridors;
   world.throughCorridors = world.throughCorridors?.filter((entry) => {
     const connections =
       resourceIndex(world).connectionsByNode.get(nodeKey(entry.point)) ?? [];
@@ -400,6 +630,7 @@ export function pruneThroughCorridors(world: World): void {
       ),
     );
   });
+  if (world.throughCorridors !== previous) invalidateCorridors(world);
 }
 
 /** Resource used while continuously passing through a node. */
@@ -612,6 +843,73 @@ function reconstructPath(
   return reversed.reverse();
 }
 
+/** A lazy-deletion binary heap keyed by a caller-supplied "is left smaller"
+ * predicate. Priority queues replace the linear frontier scans that used to
+ * make both searches quadratic in the number of visited nodes. */
+class Frontier<T> {
+  private readonly items: T[] = [];
+  constructor(private readonly smaller: (a: T, b: T) => boolean) {}
+  get size(): number {
+    return this.items.length;
+  }
+  push(item: T): void {
+    const items = this.items;
+    items.push(item);
+    let child = items.length - 1;
+    while (child > 0) {
+      const parent = (child - 1) >> 1;
+      if (!this.smaller(items[child], items[parent])) break;
+      const swap = items[parent];
+      items[parent] = items[child];
+      items[child] = swap;
+      child = parent;
+    }
+  }
+  pop(): T {
+    const items = this.items;
+    const top = items[0];
+    const last = items.pop()!;
+    if (items.length) {
+      items[0] = last;
+      let parent = 0;
+      for (;;) {
+        const left = parent * 2 + 1;
+        if (left >= items.length) break;
+        const right = left + 1;
+        const child =
+          right < items.length && this.smaller(items[right], items[left])
+            ? right
+            : left;
+        if (!this.smaller(items[child], items[parent])) break;
+        const swap = items[parent];
+        items[parent] = items[child];
+        items[child] = swap;
+        parent = child;
+      }
+    }
+    return top;
+  }
+}
+
+/** Track topology only changes with the index stamp, so the search graph is
+ * built once per topology instead of once per route query. */
+function trackGraph(world: World): Map<string, GraphEdge[]> {
+  const index = resourceIndex(world);
+  if (index.trackGraph) return index.trackGraph;
+  const graph = new Map<string, GraphEdge[]>();
+  for (const track of world.tracks) addGraphEdge(graph, track.a, track.b);
+  for (const berth of world.berths)
+    addGraphEdge(graph, berth.point, berth.access);
+  index.trackGraph = graph;
+  return graph;
+}
+
+interface TrackEntry {
+  key: string;
+  point: Point;
+  cost: number;
+}
+
 /** Finds a shortest route over built track plus every automatic berth spur. */
 function computeTrackPath(
   world: World,
@@ -621,48 +919,41 @@ function computeTrackPath(
   if (!isGridPoint(from) || !isGridPoint(to)) return null;
   if (samePoint(from, to)) return [{ ...from }];
 
-  const graph = new Map<string, GraphEdge[]>();
-  for (const track of world.tracks) addGraphEdge(graph, track.a, track.b);
-  for (const berth of world.berths)
-    addGraphEdge(graph, berth.point, berth.access);
+  const graph = trackGraph(world);
 
   const startKey = nodeKey(from);
   const endKey = nodeKey(to);
   if (!graph.has(startKey) || !graph.has(endKey)) return null;
 
-  const terminalKeys = new Set(
-    world.berths.map((berth) => nodeKey(berth.point)),
-  );
+  const terminalKeys = resourceIndex(world).berthsByPoint;
   const distances = new Map<string, number>([[startKey, 0]]);
   const parents = new Map<string, string>();
   const pointsByKey = new Map<string, Point>([[startKey, { ...from }]]);
-  const unsettled = new Set<string>([startKey]);
+  const settled = new Set<string>();
+  // Same order the former linear scan produced: lower distance first, then the
+  // lexicographically smaller node key.
+  const unsettled = new Frontier<TrackEntry>(
+    (a, b) =>
+      a.cost < b.cost - EPSILON ||
+      (Math.abs(a.cost - b.cost) <= EPSILON && a.key < b.key),
+  );
+  unsettled.push({ key: startKey, point: from, cost: 0 });
 
   while (unsettled.size) {
-    let current: string | undefined;
-    for (const key of unsettled) {
-      if (
-        current === undefined ||
-        distances.get(key)! < distances.get(current)! - EPSILON ||
-        (Math.abs(distances.get(key)! - distances.get(current)!) <= EPSILON &&
-          key < current)
-      ) {
-        current = key;
-      }
-    }
-    if (current === undefined) break;
-    unsettled.delete(current);
+    const entry = unsettled.pop();
+    const current = entry.key;
+    if (settled.has(current)) continue;
+    settled.add(current);
     if (current === endKey)
       return reconstructPath(parents, pointsByKey, endKey);
     if (terminalKeys.has(current) && current !== startKey) continue;
 
-    const neighbors = [...(graph.get(current) ?? [])].sort((a, b) =>
-      nodeKey(a.point).localeCompare(nodeKey(b.point)),
-    );
-    for (const neighbor of neighbors) {
+    const currentCost = distances.get(current)!;
+    // Neighbour order cannot matter: every neighbour updates a distinct key.
+    for (const neighbor of graph.get(current) ?? []) {
       const key = nodeKey(neighbor.point);
       if (terminalKeys.has(key) && key !== endKey) continue;
-      const candidate = distances.get(current)! + neighbor.cost;
+      const candidate = currentCost + neighbor.cost;
       if (
         candidate <
         (distances.get(key) ?? Number.POSITIVE_INFINITY) - EPSILON
@@ -670,7 +961,7 @@ function computeTrackPath(
         distances.set(key, candidate);
         parents.set(key, current);
         pointsByKey.set(key, { ...neighbor.point });
-        unsettled.add(key);
+        unsettled.push({ key, point: neighbor.point, cost: candidate });
       }
     }
   }
@@ -687,88 +978,185 @@ const WALK_DIRECTIONS: Point[] = [
   { x: 0, y: 1 },
   { x: 1, y: 1 },
 ];
+const WALK_STEP_COSTS = WALK_DIRECTIONS.map((direction) =>
+  Math.hypot(direction.x, direction.y),
+);
 
-/** Eight-direction A* for pedestrians. Diagonal steps may not cut blocked corners. */
-function computeWalkPath(world: World, from: Point, to: Point): Point[] | null {
-  // A larger city must not scan every building for every A* neighbor.
-  // This occupancy mask belongs to this search; topology changes cannot stale it.
+interface WalkGrid {
+  stamp: string;
+  occupied: Uint8Array;
+}
+const walkGrids = new WeakMap<World, WalkGrid>();
+
+/** The pedestrian obstacle mask depends only on the building footprints, so it
+ * is shared by every search until a building appears, moves, or is removed. */
+function walkOccupancy(world: World): Uint8Array {
+  let hash = world.buildings.length | 0;
+  for (const building of world.buildings) {
+    hash = (Math.imul(hash, 31) + building.x) | 0;
+    hash = (Math.imul(hash, 31) + building.y) | 0;
+    hash = (Math.imul(hash, 31) + building.w) | 0;
+    hash = (Math.imul(hash, 31) + building.h) | 0;
+  }
+  const stamp = `${world.width}x${world.height}:${world.buildings.length}:${hash}`;
+  const existing = walkGrids.get(world);
+  if (existing?.stamp === stamp) return existing.occupied;
   const occupied = new Uint8Array(world.width * world.height);
   for (const building of world.buildings)
     for (let y = building.y; y < building.y + building.h; y++)
       for (let x = building.x; x < building.x + building.w; x++)
         if (x >= 0 && y >= 0 && x < world.width && y < world.height)
           occupied[y * world.width + x] = 1;
-  const blocked = (point: Point) =>
-    !isGridPoint(point) ||
-    point.x < 0 ||
-    point.y < 0 ||
-    point.x >= world.width ||
-    point.y >= world.height ||
-    occupied[point.y * world.width + point.x] === 1;
-  if (blocked(from) || blocked(to)) return null;
+  walkGrids.set(world, { stamp, occupied });
+  return occupied;
+}
+
+/**
+ * Lexicographic rank of every `node:x,y` key on a grid of this size. The A*
+ * frontier used to break ties by comparing those strings; ranking them once
+ * keeps that exact order while comparing plain integers.
+ */
+const walkRanks = new Map<string, Int32Array>();
+function gridLexRanks(width: number, height: number): Int32Array {
+  const stamp = `${width}x${height}`;
+  const existing = walkRanks.get(stamp);
+  if (existing) return existing;
+  const size = width * height;
+  const keys = new Array<string>(size);
+  const order = new Array<number>(size);
+  for (let index = 0; index < size; index += 1) {
+    keys[index] = `${index % width},${Math.floor(index / width)}`;
+    order[index] = index;
+  }
+  order.sort((a, b) => (keys[a] < keys[b] ? -1 : keys[a] > keys[b] ? 1 : 0));
+  const ranks = new Int32Array(size);
+  for (let rank = 0; rank < size; rank += 1) ranks[order[rank]] = rank;
+  walkRanks.set(stamp, ranks);
+  return ranks;
+}
+
+/** Per-search scratch state, reused so a search allocates nothing per cell.
+ * `stamps` marks which cells the current search has already written. */
+const walkScratch = {
+  size: 0,
+  costs: new Float64Array(0),
+  parents: new Int32Array(0),
+  closed: new Uint8Array(0),
+  stamps: new Int32Array(0),
+  generation: 0,
+};
+function walkScratchFor(size: number) {
+  if (walkScratch.size !== size) {
+    walkScratch.size = size;
+    walkScratch.costs = new Float64Array(size);
+    walkScratch.parents = new Int32Array(size);
+    walkScratch.closed = new Uint8Array(size);
+    walkScratch.stamps = new Int32Array(size);
+    walkScratch.generation = 0;
+  }
+  walkScratch.generation += 1;
+  if (walkScratch.generation === 0x7fffffff) {
+    walkScratch.stamps.fill(0);
+    walkScratch.generation = 1;
+  }
+  return walkScratch;
+}
+
+interface WalkEntry {
+  index: number;
+  score: number;
+  heuristic: number;
+  rank: number;
+}
+
+/** Eight-direction A* for pedestrians. Diagonal steps may not cut blocked corners. */
+function computeWalkPath(world: World, from: Point, to: Point): Point[] | null {
+  const width = world.width;
+  const height = world.height;
+  const occupied = walkOccupancy(world);
+  const free = (x: number, y: number) =>
+    x >= 0 &&
+    y >= 0 &&
+    x < width &&
+    y < height &&
+    occupied[y * width + x] === 0;
+  if (!isGridPoint(from) || !isGridPoint(to)) return null;
+  if (!free(from.x, from.y) || !free(to.x, to.y)) return null;
   if (samePoint(from, to)) return [{ ...from }];
 
-  const startKey = nodeKey(from);
-  const endKey = nodeKey(to);
-  const open = new Set<string>([startKey]);
-  const closed = new Set<string>();
-  const costs = new Map<string, number>([[startKey, 0]]);
-  const parents = new Map<string, string>();
-  const pointsByKey = new Map<string, Point>([[startKey, { ...from }]]);
+  const size = width * height;
+  const ranks = gridLexRanks(width, height);
+  const scratch = walkScratchFor(size);
+  const { costs, parents, closed, stamps } = scratch;
+  const generation = scratch.generation;
+  const start = from.y * width + from.x;
+  const end = to.y * width + to.x;
+
+  // Same order the former linear scan produced: lowest f, then lowest
+  // heuristic, then the lexicographically smaller node key.
+  const open = new Frontier<WalkEntry>(
+    (a, b) =>
+      a.score < b.score - EPSILON ||
+      (Math.abs(a.score - b.score) <= EPSILON &&
+        (a.heuristic < b.heuristic - EPSILON ||
+          (Math.abs(a.heuristic - b.heuristic) <= EPSILON && a.rank < b.rank))),
+  );
+  const startHeuristic = distance(from, to);
+  costs[start] = 0;
+  parents[start] = -1;
+  closed[start] = 0;
+  stamps[start] = generation;
+  open.push({
+    index: start,
+    score: startHeuristic,
+    heuristic: startHeuristic,
+    rank: ranks[start],
+  });
 
   while (open.size) {
-    let currentKey: string | undefined;
-    let currentScore = Number.POSITIVE_INFINITY;
-    let currentHeuristic = Number.POSITIVE_INFINITY;
-    for (const key of open) {
-      const point = pointsByKey.get(key)!;
-      const heuristic = distance(point, to);
-      const score = costs.get(key)! + heuristic;
-      if (
-        score < currentScore - EPSILON ||
-        (Math.abs(score - currentScore) <= EPSILON &&
-          heuristic < currentHeuristic - EPSILON) ||
-        (Math.abs(score - currentScore) <= EPSILON &&
-          Math.abs(heuristic - currentHeuristic) <= EPSILON &&
-          (currentKey === undefined || key < currentKey))
-      ) {
-        currentKey = key;
-        currentScore = score;
-        currentHeuristic = heuristic;
-      }
+    const current = open.pop();
+    const index = current.index;
+    if (closed[index]) continue;
+    if (index === end) {
+      const reversed: Point[] = [];
+      for (let step = end; step !== -1; step = parents[step])
+        reversed.push({ x: step % width, y: Math.floor(step / width) });
+      return reversed.reverse();
     }
-    if (currentKey === undefined) break;
-    if (currentKey === endKey)
-      return reconstructPath(parents, pointsByKey, endKey);
-
-    open.delete(currentKey);
-    closed.add(currentKey);
-    const current = pointsByKey.get(currentKey)!;
-    for (const direction of WALK_DIRECTIONS) {
-      const next = { x: current.x + direction.x, y: current.y + direction.y };
-      if (blocked(next)) continue;
+    closed[index] = 1;
+    const x = index % width;
+    const y = (index - x) / width;
+    const cost = costs[index];
+    for (let d = 0; d < WALK_DIRECTIONS.length; d += 1) {
+      const direction = WALK_DIRECTIONS[d];
+      const nextX = x + direction.x;
+      const nextY = y + direction.y;
+      if (!free(nextX, nextY)) continue;
       if (
         direction.x !== 0 &&
         direction.y !== 0 &&
-        (blocked({ x: current.x + direction.x, y: current.y }) ||
-          blocked({ x: current.x, y: current.y + direction.y }))
-      ) {
+        (!free(nextX, y) || !free(x, nextY))
+      )
         continue;
-      }
 
-      const nextKey = nodeKey(next);
-      if (closed.has(nextKey)) continue;
-      const candidate =
-        costs.get(currentKey)! + Math.hypot(direction.x, direction.y);
-      if (
-        candidate <
-        (costs.get(nextKey) ?? Number.POSITIVE_INFINITY) - EPSILON
-      ) {
-        costs.set(nextKey, candidate);
-        parents.set(nextKey, currentKey);
-        pointsByKey.set(nextKey, next);
-        open.add(nextKey);
+      const nextIndex = nextY * width + nextX;
+      const fresh = stamps[nextIndex] !== generation;
+      if (!fresh && closed[nextIndex]) continue;
+      const candidate = cost + WALK_STEP_COSTS[d];
+      if (!fresh && candidate >= costs[nextIndex] - EPSILON) continue;
+      if (fresh) {
+        stamps[nextIndex] = generation;
+        closed[nextIndex] = 0;
       }
+      costs[nextIndex] = candidate;
+      parents[nextIndex] = index;
+      const heuristic = Math.hypot(nextX - to.x, nextY - to.y);
+      open.push({
+        index: nextIndex,
+        score: candidate + heuristic,
+        heuristic,
+        rank: ranks[nextIndex],
+      });
     }
   }
   return null;

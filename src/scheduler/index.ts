@@ -19,11 +19,14 @@ import type {
 import {
   findTrackPath,
   movementResourceOptions,
-  movementResources,
   nodeKey,
+  trackPathLength,
 } from "../network";
 import {
   assertTrajectory,
+  ensureRanked,
+  resourceRank,
+  sortResources,
   requiredTrajectoryWindows,
 } from "../shared/trajectory";
 
@@ -57,11 +60,33 @@ function route(world: World, from: Berth, to: Berth) {
   return findTrackPath(world, from.point, to.point);
 }
 
+/** Length of `route`, or null where `route` yields nothing usable. */
+function routeLength(world: World, from: Berth, to: Berth): number | null {
+  if (samePoint(from.point, to.point)) return 0;
+  return trackPathLength(world, from.point, to.point);
+}
+
 function terminalOwners(world: World, berthId: string): string[] {
   const owners: string[] = [];
   for (const pod of world.pods) {
     const terminalId = pod.plan ? pod.plan.finalBerthId : pod.berthId;
     if (terminalId === berthId) owners.push(pod.id);
+  }
+  return owners;
+}
+
+/**
+ * Every berth's durable tail commitments in one pass. Callers that ask about a
+ * whole berth list would otherwise rescan the fleet per berth.
+ */
+export function terminalOwnerIndex(world: World): Map<string, string[]> {
+  const owners = new Map<string, string[]>();
+  for (const pod of world.pods) {
+    const terminalId = pod.plan ? pod.plan.finalBerthId : pod.berthId;
+    if (terminalId === null) continue;
+    const existing = owners.get(terminalId);
+    if (existing) existing.push(pod.id);
+    else owners.set(terminalId, [pod.id]);
   }
   return owners;
 }
@@ -120,6 +145,7 @@ function appendTravel(
   for (let index = 1; index < path.length; index += 1) {
     const from = path[index - 1];
     const to = path[index];
+    const options = movementResourceOptions(world, from, to);
     cursor = appendSegment(
       segments,
       {
@@ -127,15 +153,7 @@ function appendTravel(
         to,
         kind: "move",
         stage,
-        resources: movementResources(
-          world,
-          from,
-          to,
-          Math.min(
-            laneProfile,
-            movementResourceOptions(world, from, to).length - 1,
-          ),
-        ),
+        resources: [...options[Math.min(laneProfile, options.length - 1)]],
       },
       cursor,
       (Math.hypot(to.x - from.x, to.y - from.y) * CELL_METERS) /
@@ -170,26 +188,30 @@ function appendBerthOperation(
 function mergeRelativeReservations(
   reservations: RelativeReservation[],
 ): RelativeReservation[] {
-  const sorted = reservations
-    .filter((reservation) => reservation.end - reservation.start > EPSILON)
-    .slice()
-    .sort(
-      (left, right) =>
-        left.resource.localeCompare(right.resource) ||
-        left.start - right.start ||
-        left.end - right.end,
-    );
+  const groups = new Map<string, RelativeReservation[]>();
+  for (const reservation of reservations) {
+    if (reservation.end - reservation.start <= EPSILON) continue;
+    const group = groups.get(reservation.resource);
+    if (group) group.push(reservation);
+    else groups.set(reservation.resource, [reservation]);
+  }
   const merged: RelativeReservation[] = [];
-  for (const reservation of sorted) {
-    const previous = merged[merged.length - 1];
-    if (
-      previous &&
-      previous.resource === reservation.resource &&
-      reservation.start <= previous.end + EPSILON
-    ) {
-      previous.end = Math.max(previous.end, reservation.end);
-    } else {
-      merged.push({ ...reservation });
+  for (const resource of sortResources([...groups.keys()])) {
+    const group = groups.get(resource)!;
+    group.sort(
+      (left, right) => left.start - right.start || left.end - right.end,
+    );
+    for (const reservation of group) {
+      const previous = merged[merged.length - 1];
+      if (
+        previous &&
+        previous.resource === resource &&
+        reservation.start <= previous.end + EPSILON
+      ) {
+        previous.end = Math.max(previous.end, reservation.end);
+      } else {
+        merged.push({ ...reservation });
+      }
     }
   }
   return merged;
@@ -219,15 +241,17 @@ function mergeCalendar(reservations: Reservation[]): Reservation[] {
     group.push(reservation);
     groups.set(key, group);
   }
-  return [...groups.values()]
-    .flatMap((group) => mergeReservations(group, group[0].ownerId))
-    .sort(
-      (left, right) =>
-        left.resource.localeCompare(right.resource) ||
-        left.start - right.start ||
-        left.end - right.end ||
-        left.ownerId.localeCompare(right.ownerId),
-    );
+  const merged = [...groups.values()].flatMap((group) =>
+    mergeReservations(group, group[0].ownerId),
+  );
+  ensureRanked(merged.map((reservation) => reservation.resource));
+  return merged.sort(
+    (left, right) =>
+      resourceRank(left.resource) - resourceRank(right.resource) ||
+      left.start - right.start ||
+      left.end - right.end ||
+      left.ownerId.localeCompare(right.ownerId),
+  );
 }
 
 function terminalBlocks(world: World, exceptPodId: string): TimedBlock[] {
@@ -271,18 +295,147 @@ function overlaps(
 }
 
 function existingBlocks(world: World, podId: string): TimedBlock[] {
-  return [
-    ...world.reservations
-      .filter(
-        (reservation) =>
-          reservation.ownerId !== podId &&
-          Number.isFinite(reservation.start) &&
-          Number.isFinite(reservation.end) &&
-          reservation.end > world.time,
-      )
-      .map((reservation) => ({ ...reservation })),
-    ...terminalBlocks(world, podId),
-  ];
+  const blocks: TimedBlock[] = [];
+  for (const reservation of world.reservations)
+    if (
+      reservation.ownerId !== podId &&
+      Number.isFinite(reservation.start) &&
+      Number.isFinite(reservation.end) &&
+      reservation.end > world.time
+    )
+      blocks.push(reservation);
+  for (const block of terminalBlocks(world, podId)) blocks.push(block);
+  return blocks;
+}
+
+/**
+ * One resource's blocked intervals, ordered by start with a running maximum of
+ * their ends. Every departure query is "does anything busy overlap this
+ * window, and how far must I jump past it", which both arrays answer in
+ * O(log n) instead of a scan: the blocks that could overlap are a prefix, and
+ * only the largest end in that prefix can decide the answer.
+ */
+interface ResourceCalendar {
+  starts: Float64Array;
+  runningEnd: Float64Array;
+}
+
+/** The furthest end among blocks that start before `limit`, or -Infinity. */
+function latestEndBefore(calendar: ResourceCalendar, limit: number): number {
+  const starts = calendar.starts;
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (starts[middle] < limit) low = middle + 1;
+    else high = middle;
+  }
+  return low === 0 ? Number.NEGATIVE_INFINITY : calendar.runningEnd[low - 1];
+}
+
+/**
+ * One dispatch pass asks the same Pod to plan against the same calendar dozens
+ * of times, so the result is kept until something it reads actually changes:
+ * the reservation list, the clock, or any Pod's berth or plan boundaries.
+ */
+interface CalendarCache {
+  reservations: Reservation[];
+  pods: Pod[];
+  time: number;
+  stamp: (string | number | null | undefined)[];
+  byPod: Map<string, Map<string, ResourceCalendar>>;
+}
+const calendarCaches = new WeakMap<World, CalendarCache>();
+const PLAN_STAMP_FIELDS = 4;
+
+function planStampMatches(cache: CalendarCache, pods: Pod[]): boolean {
+  if (cache.stamp.length !== pods.length * PLAN_STAMP_FIELDS) return false;
+  for (let index = 0; index < pods.length; index += 1) {
+    const pod = pods[index];
+    const at = index * PLAN_STAMP_FIELDS;
+    if (
+      cache.stamp[at] !== pod.berthId ||
+      cache.stamp[at + 1] !== pod.plan?.departure ||
+      cache.stamp[at + 2] !== pod.plan?.end ||
+      cache.stamp[at + 3] !== pod.plan?.finalBerthId
+    )
+      return false;
+  }
+  return true;
+}
+
+function planStamp(pods: Pod[]): (string | number | null | undefined)[] {
+  const stamp: (string | number | null | undefined)[] = new Array(
+    pods.length * PLAN_STAMP_FIELDS,
+  );
+  for (let index = 0; index < pods.length; index += 1) {
+    const pod = pods[index];
+    const at = index * PLAN_STAMP_FIELDS;
+    stamp[at] = pod.berthId;
+    stamp[at + 1] = pod.plan?.departure;
+    stamp[at + 2] = pod.plan?.end;
+    stamp[at + 3] = pod.plan?.finalBerthId;
+  }
+  return stamp;
+}
+
+function blockedResources(
+  world: World,
+  podId: string,
+): Map<string, ResourceCalendar> {
+  let cache = calendarCaches.get(world);
+  if (
+    !cache ||
+    cache.reservations !== world.reservations ||
+    cache.pods !== world.pods ||
+    cache.time !== world.time ||
+    !planStampMatches(cache, world.pods)
+  ) {
+    cache = {
+      reservations: world.reservations,
+      pods: world.pods,
+      time: world.time,
+      stamp: planStamp(world.pods),
+      byPod: new Map(),
+    };
+    calendarCaches.set(world, cache);
+  }
+  const cached = cache.byPod.get(podId);
+  if (cached) return cached;
+  const calendars = computeBlockedResources(world, podId);
+  cache.byPod.set(podId, calendars);
+  return calendars;
+}
+
+/**
+ * The calendar a Pod has to fit into, grouped by resource. It only depends on
+ * the world and the Pod, so one planning call shares it across every terminal,
+ * lane profile and candidate departure it tries.
+ */
+function computeBlockedResources(
+  world: World,
+  podId: string,
+): Map<string, ResourceCalendar> {
+  const grouped = new Map<string, TimedBlock[]>();
+  for (const block of existingBlocks(world, podId)) {
+    const entries = grouped.get(block.resource);
+    if (entries) entries.push(block);
+    else grouped.set(block.resource, [block]);
+  }
+  const calendars = new Map<string, ResourceCalendar>();
+  for (const [resource, blocks] of grouped) {
+    blocks.sort((left, right) => left.start - right.start);
+    const starts = new Float64Array(blocks.length);
+    const runningEnd = new Float64Array(blocks.length);
+    let furthest = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < blocks.length; index += 1) {
+      starts[index] = blocks[index].start;
+      furthest = Math.max(furthest, blocks[index].end);
+      runningEnd[index] = furthest;
+    }
+    calendars.set(resource, { starts, runningEnd });
+  }
+  return calendars;
 }
 
 function absoluteSegments(
@@ -305,24 +458,41 @@ function searchDeparture(
   origin: Berth,
   finalBerth: Berth,
   template: MotionSegment[],
+  calendars: Map<string, ResourceCalendar>,
 ): {
   departure: number;
   segments: MotionSegment[];
   reservations: Reservation[];
 } | null {
   const relative = relativeReservations(world, template);
-  const blocks = existingBlocks(world, pod.id);
-  const blocksByResource = new Map<string, TimedBlock[]>();
-  for (const block of blocks) {
-    const entries = blocksByResource.get(block.resource) ?? [];
-    entries.push(block);
-    blocksByResource.set(block.resource, entries);
-  }
   const duration = template[template.length - 1]?.end ?? 0;
   if (duration > PLANNING_WINDOW_SECONDS + EPSILON) return null;
   const latestDeparture =
     world.time + Math.max(0, PLANNING_WINDOW_SECONDS - duration);
   let departure = world.time;
+
+  // Only the windows that can actually collide are rescanned per candidate
+  // departure; on a quiet resource there is nothing to compare against.
+  const contested: {
+    window: RelativeReservation;
+    calendar: ResourceCalendar;
+  }[] = [];
+  for (const proposed of relative) {
+    const calendar = calendars.get(proposed.resource);
+    if (calendar?.starts.length) contested.push({ window: proposed, calendar });
+  }
+  const finalCalendar = calendars.get(berthResource(finalBerth.id));
+  const finalEnd = finalCalendar?.starts.length
+    ? finalCalendar.runningEnd[finalCalendar.starts.length - 1]
+    : Number.NEGATIVE_INFINITY;
+
+  // Candidate departures only ever move forward, so each window's set of
+  // possibly-overlapping blocks only ever grows: a cursor walks it once in
+  // total instead of being re-derived on every attempt. A window whose blocks
+  // are all behind the candidate can never come back, so it leaves the scan
+  // for good and later attempts only look at what is still in the way.
+  const cursors = new Int32Array(contested.length);
+  let active = contested.length;
 
   for (
     let step = 0;
@@ -331,36 +501,46 @@ function searchDeparture(
   ) {
     let jump = departure;
     let impossible = false;
-    for (const proposed of relative) {
-      const start = proposed.start + departure;
-      const end = proposed.end + departure;
-      for (const block of blocksByResource.get(proposed.resource) ?? []) {
-        if (!overlaps(start, end, block.start, block.end)) continue;
-        if (!Number.isFinite(block.end)) {
-          impossible = true;
-          break;
+    for (let index = 0; index < active; index += 1) {
+      const { window: proposed, calendar } = contested[index];
+      const starts = calendar.starts;
+      const limit = proposed.end + departure - EPSILON;
+      let cursor = cursors[index];
+      while (cursor < starts.length && starts[cursor] < limit) cursor += 1;
+      cursors[index] = cursor;
+      // Only the block reaching furthest past this window can set the jump;
+      // every other overlap it hides would move the departure less.
+      const blockedUntil =
+        cursor === 0
+          ? Number.NEGATIVE_INFINITY
+          : calendar.runningEnd[cursor - 1];
+      if (!(proposed.start + departure < blockedUntil - EPSILON)) {
+        // Nothing is left to walk into and this window already clears what it
+        // found, so no later, later-still departure can be blocked by it.
+        if (cursor === starts.length) {
+          active -= 1;
+          contested[index] = contested[active];
+          cursors[index] = cursors[active];
+          index -= 1;
         }
-        jump = Math.max(jump, block.end - proposed.start);
+        continue;
       }
-      if (impossible) break;
+      if (!Number.isFinite(blockedUntil)) {
+        impossible = true;
+        break;
+      }
+      const candidate = blockedUntil - proposed.start;
+      if (candidate > jump) jump = candidate;
     }
     if (impossible) return null;
 
     // A final berth becomes a durable tail commitment at plan end. Delay the
     // entire plan until every already-approved finite visit to that berth is over.
     const proposedEnd = departure + duration;
-    for (const block of blocksByResource.get(berthResource(finalBerth.id)) ??
-      []) {
-      if (block.end <= proposedEnd + EPSILON) {
-        continue;
-      }
-      if (!Number.isFinite(block.end)) {
-        impossible = true;
-        break;
-      }
-      jump = Math.max(jump, block.end - duration);
+    if (finalEnd > proposedEnd + EPSILON) {
+      if (!Number.isFinite(finalEnd)) return null;
+      jump = Math.max(jump, finalEnd - duration);
     }
-    if (impossible) return null;
 
     if (jump <= departure + EPSILON) {
       const segments = absoluteSegments(template, departure);
@@ -386,18 +566,15 @@ function searchDeparture(
         pod.id,
       );
       if (
-        reservations.some((reservation) =>
-          (blocksByResource.get(reservation.resource) ?? []).some(
-            (block) =>
-              block.resource === reservation.resource &&
-              overlaps(
-                reservation.start,
-                reservation.end,
-                block.start,
-                block.end,
-              ),
-          ),
-        )
+        reservations.some((reservation) => {
+          const calendar = calendars.get(reservation.resource);
+          if (!calendar) return false;
+          const blockedUntil = latestEndBefore(
+            calendar,
+            reservation.end - EPSILON,
+          );
+          return reservation.start < blockedUntil - EPSILON;
+        })
       ) {
         return null;
       }
@@ -416,13 +593,15 @@ function serviceTerminalCandidates(
 ): TerminalCandidate[] {
   const candidates: TerminalCandidate[] = [];
   const seen = new Set<string>();
+  const owners = terminalOwnerIndex(world);
+  const pending = new Set(world.pendingEdits.map((edit) => edit.id));
 
   const add = (berth: Berth) => {
     if (
       berth.kind !== "parking" ||
       seen.has(berth.id) ||
-      !terminalAvailable(world, berth.id, pod.id) ||
-      world.pendingEdits.some((edit) => edit.id === berth.id)
+      !(owners.get(berth.id) ?? []).every((ownerId) => ownerId === pod.id) ||
+      pending.has(berth.id)
     )
       return;
     const relocationPath = route(world, dropoff, berth);
@@ -434,10 +613,8 @@ function serviceTerminalCandidates(
   const nearbyParking = world.berths
     .filter((berth) => berth.kind === "parking")
     .flatMap((berth) => {
-      const path = route(world, dropoff, berth);
-      return pathIsUsable(path)
-        ? [{ berth, path, distance: pathLength(path) }]
-        : [];
+      const length = routeLength(world, dropoff, berth);
+      return length === null ? [] : [{ berth, distance: length }];
     })
     .sort(
       (left, right) =>
@@ -582,6 +759,7 @@ export function planService(
         laneProfile: number;
       }
     | undefined;
+  const calendars = blockedResources(world, pod.id);
   for (const terminal of terminals) {
     if (!pathIsUsable(terminal.relocationPath)) continue;
     const seenProfiles = new Set<string>();
@@ -608,6 +786,7 @@ export function planService(
         origin,
         terminal.berth,
         template.segments,
+        calendars,
       );
       if (!scheduled) continue;
       const arrival = template.dropoffEnd + scheduled.departure;
@@ -682,6 +861,7 @@ export function planRelocation(
     return { ok: false, reason: "disconnected" };
 
   let scheduled: ReturnType<typeof searchDeparture> = null;
+  const calendars = blockedResources(world, pod.id);
   const seenProfiles = new Set<string>();
   for (const laneProfile of [0, 1, 2]) {
     const template: MotionSegment[] = [];
@@ -713,6 +893,7 @@ export function planRelocation(
       origin,
       actualTarget,
       template,
+      calendars,
     );
     if (
       candidate &&

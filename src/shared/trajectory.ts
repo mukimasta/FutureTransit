@@ -8,16 +8,64 @@ import {
 } from "./constants";
 import { distance, samePoint } from "./math";
 import {
+  berthAtPoint,
   canonicalMovementResources,
+  dwellResources,
   edgeResources,
-  exclusiveNodeResources,
   movementNodeResources,
   movementLaneIndex,
+  movementResources,
   nodeKey,
 } from "../network";
 import type { MotionSegment, ServicePlan, World } from "./types";
 
 const EPSILON = 1e-6;
+
+/**
+ * Resource ordering matches `localeCompare` exactly; a shared collator just
+ * avoids re-deriving the default one on every comparison.
+ */
+const resourceCollator = new Intl.Collator();
+const compareResource = resourceCollator.compare;
+
+/**
+ * Collation is settled for the lifetime of a session, so each resource name is
+ * placed once in a global order and compared by integer rank afterwards. A
+ * network of fixed size stops adding names after its first few plans, and
+ * ordering its resources then costs no collator calls at all.
+ */
+const resourceRanks = new Map<string, number>();
+const compareByRank = (left: string, right: string) =>
+  resourceRanks.get(left)! - resourceRanks.get(right)!;
+
+function rankResources(resources: Iterable<string>): void {
+  const ordered = [...new Set([...resourceRanks.keys(), ...resources])].sort(
+    compareResource,
+  );
+  resourceRanks.clear();
+  for (let index = 0; index < ordered.length; index += 1)
+    resourceRanks.set(ordered[index], index);
+}
+
+/** Place any unranked name in the table, so `resourceRank` can answer for it. */
+export function ensureRanked(resources: Iterable<string>): void {
+  for (const resource of resources)
+    if (!resourceRanks.has(resource)) {
+      rankResources(resources);
+      return;
+    }
+}
+
+/** Collation rank of a resource passed through `ensureRanked`. */
+export function resourceRank(resource: string): number {
+  return resourceRanks.get(resource)!;
+}
+
+/** Sort into collator order, in place, via the shared rank table. */
+export function sortResources(resources: string[]): string[] {
+  ensureRanked(resources);
+  return resources.sort(compareByRank);
+}
 
 export interface TrajectoryReservationWindow {
   resource: string;
@@ -26,9 +74,7 @@ export interface TrajectoryReservationWindow {
 }
 
 function pointResources(world: World, point: MotionSegment["from"]): string[] {
-  const berth = world.berths.find((candidate) =>
-    samePoint(candidate.point, point),
-  );
+  const berth = berthAtPoint(world, point);
   return [nodeKey(point), ...(berth ? [`berth:${berth.id}`] : [])];
 }
 
@@ -47,37 +93,41 @@ function segmentMovementResources(
 }
 
 function pointWindows(world: World, point: MotionSegment["from"]): string[] {
-  return [
-    ...new Set([
-      ...pointResources(world, point),
-      ...exclusiveNodeResources(world, point),
-    ]),
-  ];
+  return dwellResources(world, point);
 }
 
+/**
+ * Group first, then order. Interval merging only ever compares windows that
+ * share a resource, so the collator runs once per distinct resource instead of
+ * once per comparison in a sort over every window.
+ */
 function mergeWindows(
   windows: TrajectoryReservationWindow[],
 ): TrajectoryReservationWindow[] {
-  const sorted = windows
-    .filter((window) => window.end - window.start > EPSILON)
-    .slice()
-    .sort(
-      (left, right) =>
-        left.resource.localeCompare(right.resource) ||
-        left.start - right.start ||
-        left.end - right.end,
-    );
+  const groups = new Map<string, TrajectoryReservationWindow[]>();
+  for (const window of windows) {
+    if (window.end - window.start <= EPSILON) continue;
+    const group = groups.get(window.resource);
+    if (group) group.push(window);
+    else groups.set(window.resource, [window]);
+  }
   const merged: TrajectoryReservationWindow[] = [];
-  for (const window of sorted) {
-    const previous = merged.at(-1);
-    if (
-      previous &&
-      previous.resource === window.resource &&
-      window.start <= previous.end + EPSILON
-    ) {
-      previous.end = Math.max(previous.end, window.end);
-    } else {
-      merged.push({ ...window });
+  for (const resource of sortResources([...groups.keys()])) {
+    const group = groups.get(resource)!;
+    group.sort(
+      (left, right) => left.start - right.start || left.end - right.end,
+    );
+    for (const window of group) {
+      const previous = merged[merged.length - 1];
+      if (
+        previous &&
+        previous.resource === resource &&
+        window.start <= previous.end + EPSILON
+      ) {
+        previous.end = Math.max(previous.end, window.end);
+      } else {
+        merged.push({ ...window });
+      }
     }
   }
   return merged;
@@ -101,34 +151,54 @@ export function requiredTrajectoryWindows(
   const add = (resources: string[], start: number, end: number) => {
     for (const resource of resources) windows.push({ resource, start, end });
   };
+  // Each move is resolved by its own pass and again as its neighbours' buffer,
+  // so both derivations are memoized per segment for the length of this call.
+  const resolved: ({ lane: number | null; resources: string[] } | undefined)[] =
+    new Array(segments.length);
+  const resolve = (index: number) => {
+    const cached = resolved[index];
+    if (cached) return cached;
+    const segment = segments[index];
+    const lane = movementLaneIndex(
+      world,
+      segment.from,
+      segment.to,
+      segment.resources,
+    );
+    const entry = {
+      lane,
+      resources:
+        lane === null
+          ? []
+          : movementResources(world, segment.from, segment.to, lane),
+    };
+    resolved[index] = entry;
+    return entry;
+  };
+  const resourcesOf = (index: number): string[] => resolve(index).resources;
+  const laneOf = (index: number): number | null => resolve(index).lane;
 
   for (const [index, segment] of segments.entries()) {
     if (segment.kind === "move") {
-      add(
-        segmentMovementResources(world, segment),
-        segment.start,
-        segment.end + CLEARANCE_SECONDS,
-      );
+      add(resourcesOf(index), segment.start, segment.end + CLEARANCE_SECONDS);
       if (safetyBuffer === 1) {
-        const neighboringMoves = [
-          segments[index - 1],
-          segments[index + 1],
-        ].filter(
-          (neighbor): neighbor is MotionSegment =>
-            neighbor?.kind === "move" &&
-            (samePoint(neighbor.to, segment.from) ||
-              samePoint(segment.to, neighbor.from)),
-        );
         const bufferedEnd = Math.min(
           trajectoryEnd,
           segment.end + CLEARANCE_SECONDS,
         );
-        for (const neighbor of neighboringMoves)
-          add(
-            segmentMovementResources(world, neighbor),
-            segment.start,
-            bufferedEnd,
-          );
+        for (const offset of [-1, 1]) {
+          const neighborIndex = index + offset;
+          const neighbor = segments[neighborIndex];
+          if (
+            neighbor?.kind !== "move" ||
+            !(
+              samePoint(neighbor.to, segment.from) ||
+              samePoint(segment.to, neighbor.from)
+            )
+          )
+            continue;
+          add(resourcesOf(neighborIndex), segment.start, bufferedEnd);
+        }
       }
 
       // A continuous trajectory has no preceding dwell at its first point.
@@ -142,15 +212,10 @@ export function requiredTrajectoryWindows(
 
       // Arrival reserves the junction/berth without extending visible travel.
       const next = segments[index + 1];
-      const incomingLane = movementLaneIndex(
-        world,
-        segment.from,
-        segment.to,
-        segment.resources,
-      );
+      const incomingLane = laneOf(index);
       const outgoingLane =
         next?.kind === "move" && samePoint(next.from, segment.to)
-          ? movementLaneIndex(world, next.from, next.to, next.resources)
+          ? laneOf(index + 1)
           : null;
       const arrivalResources =
         next?.kind === "move" &&

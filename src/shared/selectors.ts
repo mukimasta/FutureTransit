@@ -1,6 +1,59 @@
-import type { Language, Pod, Point, Resident, World } from "./types";
+import type { Berth, Language, Pod, Point, Resident, World } from "./types";
 import { alongPath } from "./math";
-import { edgeKey, movementLaneIndex } from "../network";
+import { movementLaneIndex, trackBetween } from "../network";
+
+/**
+ * Rendering resamples every Pod and Resident 60 times a second, so the lookups
+ * those samples share are built once per world snapshot instead of once per
+ * sample. A snapshot is a fresh object from the worker, so the entries never
+ * go stale.
+ */
+interface FrameIndex {
+  time: number;
+  residents: Resident[];
+  berths: Berth[];
+  pods: Pod[];
+  berthsById: Map<string, Berth>;
+  podsById: Map<string, Pod>;
+  /**
+   * Position of each waiting Resident within its pickup queue, in the same
+   * `world.residents` order the queue used to be filtered out of.
+   */
+  queuePlaces: Map<string, number>;
+}
+const frameIndexes = new WeakMap<World, FrameIndex>();
+
+function frameIndex(world: World): FrameIndex {
+  const existing = frameIndexes.get(world);
+  if (
+    existing &&
+    existing.time === world.time &&
+    existing.residents === world.residents &&
+    existing.berths === world.berths &&
+    existing.pods === world.pods
+  )
+    return existing;
+  const queuePlaces = new Map<string, number>();
+  const counts = new Map<string, number>();
+  for (const resident of world.residents) {
+    const pickupId = resident.journey?.pickupId;
+    if (resident.status !== "waiting" || !pickupId) continue;
+    const place = counts.get(pickupId) ?? 0;
+    counts.set(pickupId, place + 1);
+    queuePlaces.set(resident.id, place);
+  }
+  const index: FrameIndex = {
+    time: world.time,
+    residents: world.residents,
+    berths: world.berths,
+    pods: world.pods,
+    berthsById: new Map(world.berths.map((berth) => [berth.id, berth])),
+    podsById: new Map(world.pods.map((pod) => [pod.id, pod])),
+    queuePlaces,
+  };
+  frameIndexes.set(world, index);
+  return index;
+}
 
 export function podPosition(world: World, pod: Pod, time = world.time): Point {
   const plan = pod.plan;
@@ -16,11 +69,7 @@ export function podPosition(world: World, pod: Pod, time = world.time): Point {
         y: segment.from.y + (segment.to.y - segment.from.y) * t,
       };
       if (segment.kind === "move") {
-        const key = edgeKey(segment.from, segment.to);
-        const track = world.tracks.find(
-          (candidate) => edgeKey(candidate.a, candidate.b) === key,
-        );
-        const lanes = track?.lanes ?? 1;
+        const lanes = trackBetween(world, segment.from, segment.to)?.lanes ?? 1;
         const laneIndex = movementLaneIndex(
           world,
           segment.from,
@@ -48,12 +97,13 @@ export function podPosition(world: World, pod: Pod, time = world.time): Point {
     const berthId =
       time < plan.departure ? plan.originBerthId : plan.finalBerthId;
     return (
-      world.berths.find((b) => b.id === berthId)?.point ??
+      frameIndex(world).berthsById.get(berthId)?.point ??
       plan.segments.at(-1)?.to ?? { x: 0, y: 0 }
     );
   }
   return (
-    world.berths.find((b) => b.id === pod.berthId)?.point ?? { x: 0, y: 0 }
+    (pod.berthId ? frameIndex(world).berthsById.get(pod.berthId) : undefined)
+      ?.point ?? { x: 0, y: 0 }
   );
 }
 export function residentPosition(
@@ -65,7 +115,9 @@ export function residentPosition(
   const journey = resident.journey;
   if (!journey) return null;
   if (["boarding", "riding", "alighting"].includes(resident.status)) {
-    const pod = world.pods.find((p) => p.id === journey.podId);
+    const pod = journey.podId
+      ? frameIndex(world).podsById.get(journey.podId)
+      : undefined;
     return pod ? podPosition(world, pod, time) : null;
   }
   if (resident.status === "walking" && journey.walk)
@@ -73,15 +125,15 @@ export function residentPosition(
       journey.walk.path,
       (time - journey.walk.start) / (journey.walk.end - journey.walk.start),
     );
-  const berth = world.berths.find((b) => b.id === journey.pickupId);
+  const index = frameIndex(world);
+  const berth = journey.pickupId
+    ? index.berthsById.get(journey.pickupId)
+    : undefined;
   if (!berth) return null;
-  const queue = world.residents.filter(
-    (r) => r.status === "waiting" && r.journey?.pickupId === berth.id,
-  );
-  const index = queue.findIndex((r) => r.id === resident.id);
+  const place = index.queuePlaces.get(resident.id) ?? -1;
   return {
-    x: berth.point.x + 0.48 + (index % 5) * 0.26,
-    y: berth.point.y + 0.48 + Math.floor(index / 5) * 0.28,
+    x: berth.point.x + 0.48 + (place % 5) * 0.26,
+    y: berth.point.y + 0.48 + Math.floor(place / 5) * 0.28,
   };
 }
 export function berthOccupant(world: World, berthId: string): Pod | undefined {

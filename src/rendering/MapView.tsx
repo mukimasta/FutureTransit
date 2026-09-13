@@ -1,5 +1,7 @@
 import {
   createContext,
+  memo,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -212,6 +214,76 @@ function buildingRect(building: Building) {
     height: building.h - 0.2,
   };
 }
+
+const EMPTY_TRACK_IDS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * A waiting Resident's dot is a pure function of the world snapshot, so it is
+ * only rebuilt when one of these values actually moves. Rush hour parks
+ * hundreds of Residents in queues, and re-deriving every one of them sixty
+ * times a second is what makes the map stop responding.
+ */
+const ResidentMarker = memo(function ResidentMarker({
+  id,
+  name,
+  color,
+  x,
+  y,
+  selected,
+  focused,
+  crosshair,
+  onPick,
+  onKey,
+}: {
+  id: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+  selected: boolean;
+  focused: boolean;
+  crosshair: boolean;
+  onPick: (
+    event: React.MouseEvent<SVGElement>,
+    next: NonNullable<Selection>,
+  ) => void;
+  onKey: (
+    event: ReactKeyboardEvent<SVGGElement>,
+    next: NonNullable<Selection>,
+  ) => void;
+}) {
+  return (
+    <g
+      data-map-entity="resident"
+      data-resident-id={id}
+      role="button"
+      tabIndex={0}
+      aria-label={name}
+      style={{ cursor: crosshair ? "crosshair" : "pointer" }}
+      onClick={(event) => onPick(event, { kind: "resident", id })}
+      onKeyDown={(event) => onKey(event, { kind: "resident", id })}
+    >
+      {(selected || focused) && (
+        <circle
+          cx={x}
+          cy={y}
+          r="0.42"
+          fill="none"
+          stroke={selected ? "#d7873f" : "#d19b58"}
+          strokeWidth="0.12"
+        />
+      )}
+      <circle
+        cx={x}
+        cy={y}
+        r="0.2"
+        fill={color}
+        stroke="#fffdf7"
+        strokeWidth="0.07"
+      />
+    </g>
+  );
+});
 
 function shortName(name: string, language: MapViewProps["language"]): string {
   const limit = language === "zh" ? 6 : 15;
@@ -480,6 +552,16 @@ export function MapView({
     );
   };
 
+  // Marker memoization needs handler identities that survive a frame; the
+  // behaviour still comes from the current render's closure.
+  const selectEntityRef = useRef(selectEntity);
+  selectEntityRef.current = selectEntity;
+  const pickEntity = useCallback(
+    (event: React.MouseEvent<SVGElement>, next: NonNullable<Selection>) =>
+      selectEntityRef.current(event, next),
+    [],
+  );
+
   const selectEntityByKeyboard = (
     event: ReactKeyboardEvent<SVGGElement>,
     next: NonNullable<Selection>,
@@ -507,6 +589,13 @@ export function MapView({
       mapPoint,
     );
   };
+  const keyEntityRef = useRef(selectEntityByKeyboard);
+  keyEntityRef.current = selectEntityByKeyboard;
+  const keyEntity = useCallback(
+    (event: ReactKeyboardEvent<SVGGElement>, next: NonNullable<Selection>) =>
+      keyEntityRef.current(event, next),
+    [],
+  );
 
   const onPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (
@@ -645,8 +734,19 @@ export function MapView({
     }
     return result;
   }, [world.tracks]);
+  const residentsById = useMemo(
+    () => new Map(world.residents.map((resident) => [resident.id, resident])),
+    [world.residents],
+  );
+  // The Resident being followed and the building they stand in, resolved once
+  // instead of once per building on every animation frame.
+  const trackedEntity =
+    focusTarget?.kind === "resident"
+      ? residentsById.get(focusTarget.id)
+      : undefined;
+  const trackedBuildingId = trackedEntity?.atBuildingId;
   const activeTracks = useMemo(() => {
-    if (layer !== "flow") return new Set<string>();
+    if (layer !== "flow") return EMPTY_TRACK_IDS;
     const resources = new Set(
       world.reservations
         .filter((item) => item.start <= displayTime && displayTime < item.end)
@@ -687,6 +787,197 @@ export function MapView({
     }
     return [];
   };
+
+  // Buildings only move with the world snapshot, never with the animation
+  // clock, so the layer is rebuilt ten times a second rather than sixty.
+  const buildingLayer = useMemo(
+    () => (
+      <g aria-label={language === "zh" ? "建筑" : "Buildings"}>
+        {world.buildings.map((building) => {
+          const rect = buildingRect(building);
+          const colors = BUILDING_COLORS[building.kind];
+          const selected = sameSelection(selection, "building", building.id);
+          const trackedResident =
+            trackedBuildingId === building.id ? trackedEntity : undefined;
+          const focused =
+            sameSelection(focusTarget, "building", building.id) ||
+            !!trackedResident;
+          const count = indoors.get(building.id) ?? 0;
+          const development = building.development;
+          const name = shortName(
+            language === "zh" ? building.name : building.nameEn,
+            language,
+          );
+          const centerX = building.x + (building.w - 1) / 2;
+          const centerY = building.y + (building.h - 1) / 2;
+          return (
+            <g
+              key={building.id}
+              data-map-entity="building"
+              data-building-id={building.id}
+              data-development-stage={development?.stage}
+              data-building-role={development?.role}
+              data-tracked-resident={trackedResident?.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`${language === "zh" ? building.name : building.nameEn}, ${count}`}
+              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
+              onClick={(event) =>
+                pickEntity(event, { kind: "building", id: building.id })
+              }
+              onKeyDown={(event) =>
+                keyEntity(event, {
+                  kind: "building",
+                  id: building.id,
+                })
+              }
+            >
+              {(selected || focused) && (
+                <rect
+                  {...rect}
+                  x={rect.x - 0.16}
+                  y={rect.y - 0.16}
+                  width={rect.width + 0.32}
+                  height={rect.height + 0.32}
+                  rx="0.5"
+                  fill="none"
+                  stroke={selected ? "#d7873f" : "#d19b58"}
+                  strokeWidth={selected ? 0.2 : 0.12}
+                  opacity={selected ? 1 : 0.65}
+                />
+              )}
+              {building.kind === "park" ? (
+                <g filter="url(#map-soft-shadow)" pointerEvents="none">
+                  <rect
+                    {...rect}
+                    rx="1.05"
+                    fill={colors.fill}
+                    stroke={colors.edge}
+                    strokeWidth="0.11"
+                  />
+                  {[-0.48, 0, 0.48].map((offset) => (
+                    <circle
+                      key={offset}
+                      cx={centerX + offset}
+                      cy={centerY - 0.18 + (offset === 0 ? 0.16 : 0)}
+                      r="0.2"
+                      fill="#a9c49e"
+                      opacity="0.78"
+                    />
+                  ))}
+                </g>
+              ) : (
+                <rect
+                  {...rect}
+                  rx="0.42"
+                  fill={colors.fill}
+                  stroke={colors.edge}
+                  strokeWidth="0.11"
+                  filter="url(#map-soft-shadow)"
+                />
+              )}
+              {trackedResident && (
+                <text
+                  x={centerX}
+                  y={rect.y - 0.5}
+                  textAnchor="middle"
+                  fill="#a97038"
+                  fontSize=".58"
+                  pointerEvents="none"
+                >
+                  {trackedResident.name} ·{" "}
+                  {language === "zh" ? "楼内" : "inside"}
+                </text>
+              )}
+              <circle
+                cx={buildingDoor(building).x}
+                cy={buildingDoor(building).y}
+                r="0.11"
+                fill={colors.edge}
+                opacity="0.85"
+                pointerEvents="none"
+              />
+              <text
+                x={centerX}
+                y={centerY - 0.08}
+                textAnchor="middle"
+                dominantBaseline="central"
+                fill="#3f4845"
+                fontSize="0.76"
+                fontWeight="650"
+                letterSpacing="-0.015"
+                pointerEvents="none"
+              >
+                {name}
+              </text>
+              <text
+                x={centerX}
+                y={centerY + 0.83}
+                textAnchor="middle"
+                dominantBaseline="central"
+                fill="#68716d"
+                fontSize="0.56"
+                pointerEvents="none"
+              >
+                {language === "zh" ? `${count} 人` : `${count} here`}
+              </text>
+              {development && (
+                <g pointerEvents="none" aria-hidden="true">
+                  {development.role !== "local" && (
+                    <text
+                      x={centerX}
+                      y={building.y + 0.42}
+                      textAnchor="middle"
+                      fill={
+                        development.role === "employment"
+                          ? "#4b748d"
+                          : "#99733b"
+                      }
+                      fontSize=".37"
+                      fontWeight="650"
+                    >
+                      {development.role === "employment"
+                        ? language === "zh"
+                          ? "就业中心"
+                          : "JOB CENTER"
+                        : language === "zh"
+                          ? "商业中心"
+                          : "RETAIL CENTER"}
+                    </text>
+                  )}
+                  {[1, 2, 3].map((stage) => (
+                    <rect
+                      key={stage}
+                      x={centerX - 0.7 + (stage - 1) * 0.5}
+                      y={building.y + building.h - 0.58}
+                      width=".4"
+                      height=".1"
+                      rx=".04"
+                      fill={
+                        stage <= development.stage ? colors.edge : "#c9d0c8"
+                      }
+                    />
+                  ))}
+                </g>
+              )}
+            </g>
+          );
+        })}
+      </g>
+    ),
+    [
+      focusTarget,
+      indoors,
+      keyEntity,
+      language,
+      layingTrack,
+      pickEntity,
+      selection,
+      trackedBuildingId,
+      trackedEntity,
+      world.buildings,
+    ],
+  );
 
   const focusPath = highlightPath(focusTarget);
   const selectedPath = highlightPath(selection);
@@ -1064,183 +1355,7 @@ export function MapView({
         </g>
       )}
 
-      <g aria-label={language === "zh" ? "建筑" : "Buildings"}>
-        {world.buildings.map((building) => {
-          const rect = buildingRect(building);
-          const colors = BUILDING_COLORS[building.kind];
-          const selected = sameSelection(selection, "building", building.id);
-          const trackedResident =
-            focusTarget?.kind === "resident"
-              ? world.residents.find(
-                  (r) =>
-                    r.id === focusTarget.id && r.atBuildingId === building.id,
-                )
-              : undefined;
-          const focused =
-            sameSelection(focusTarget, "building", building.id) ||
-            !!trackedResident;
-          const count = indoors.get(building.id) ?? 0;
-          const development = building.development;
-          const name = shortName(
-            language === "zh" ? building.name : building.nameEn,
-            language,
-          );
-          const centerX = building.x + (building.w - 1) / 2;
-          const centerY = building.y + (building.h - 1) / 2;
-          return (
-            <g
-              key={building.id}
-              data-map-entity="building"
-              data-building-id={building.id}
-              data-development-stage={development?.stage}
-              data-building-role={development?.role}
-              data-tracked-resident={trackedResident?.id}
-              role="button"
-              tabIndex={0}
-              aria-label={`${language === "zh" ? building.name : building.nameEn}, ${count}`}
-              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
-              onClick={(event) =>
-                selectEntity(event, { kind: "building", id: building.id })
-              }
-              onKeyDown={(event) =>
-                selectEntityByKeyboard(event, {
-                  kind: "building",
-                  id: building.id,
-                })
-              }
-            >
-              {(selected || focused) && (
-                <rect
-                  {...rect}
-                  x={rect.x - 0.16}
-                  y={rect.y - 0.16}
-                  width={rect.width + 0.32}
-                  height={rect.height + 0.32}
-                  rx="0.5"
-                  fill="none"
-                  stroke={selected ? "#d7873f" : "#d19b58"}
-                  strokeWidth={selected ? 0.2 : 0.12}
-                  opacity={selected ? 1 : 0.65}
-                />
-              )}
-              {building.kind === "park" ? (
-                <g filter="url(#map-soft-shadow)" pointerEvents="none">
-                  <rect
-                    {...rect}
-                    rx="1.05"
-                    fill={colors.fill}
-                    stroke={colors.edge}
-                    strokeWidth="0.11"
-                  />
-                  {[-0.48, 0, 0.48].map((offset) => (
-                    <circle
-                      key={offset}
-                      cx={centerX + offset}
-                      cy={centerY - 0.18 + (offset === 0 ? 0.16 : 0)}
-                      r="0.2"
-                      fill="#a9c49e"
-                      opacity="0.78"
-                    />
-                  ))}
-                </g>
-              ) : (
-                <rect
-                  {...rect}
-                  rx="0.42"
-                  fill={colors.fill}
-                  stroke={colors.edge}
-                  strokeWidth="0.11"
-                  filter="url(#map-soft-shadow)"
-                />
-              )}
-              {trackedResident && (
-                <text
-                  x={centerX}
-                  y={rect.y - 0.5}
-                  textAnchor="middle"
-                  fill="#a97038"
-                  fontSize=".58"
-                  pointerEvents="none"
-                >
-                  {trackedResident.name} ·{" "}
-                  {language === "zh" ? "楼内" : "inside"}
-                </text>
-              )}
-              <circle
-                cx={buildingDoor(building).x}
-                cy={buildingDoor(building).y}
-                r="0.11"
-                fill={colors.edge}
-                opacity="0.85"
-                pointerEvents="none"
-              />
-              <text
-                x={centerX}
-                y={centerY - 0.08}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fill="#3f4845"
-                fontSize="0.76"
-                fontWeight="650"
-                letterSpacing="-0.015"
-                pointerEvents="none"
-              >
-                {name}
-              </text>
-              <text
-                x={centerX}
-                y={centerY + 0.83}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fill="#68716d"
-                fontSize="0.56"
-                pointerEvents="none"
-              >
-                {language === "zh" ? `${count} 人` : `${count} here`}
-              </text>
-              {development && (
-                <g pointerEvents="none" aria-hidden="true">
-                  {development.role !== "local" && (
-                    <text
-                      x={centerX}
-                      y={building.y + 0.42}
-                      textAnchor="middle"
-                      fill={
-                        development.role === "employment"
-                          ? "#4b748d"
-                          : "#99733b"
-                      }
-                      fontSize=".37"
-                      fontWeight="650"
-                    >
-                      {development.role === "employment"
-                        ? language === "zh"
-                          ? "就业中心"
-                          : "JOB CENTER"
-                        : language === "zh"
-                          ? "商业中心"
-                          : "RETAIL CENTER"}
-                    </text>
-                  )}
-                  {[1, 2, 3].map((stage) => (
-                    <rect
-                      key={stage}
-                      x={centerX - 0.7 + (stage - 1) * 0.5}
-                      y={building.y + building.h - 0.58}
-                      width=".4"
-                      height=".1"
-                      rx=".04"
-                      fill={
-                        stage <= development.stage ? colors.edge : "#c9d0c8"
-                      }
-                    />
-                  ))}
-                </g>
-              )}
-            </g>
-          );
-        })}
-      </g>
+      {buildingLayer}
 
       <g aria-label={language === "zh" ? "泊位" : "Berths"}>
         {world.berths.map((berth: Berth) => {
@@ -1387,46 +1502,20 @@ export function MapView({
             return null;
           const position = residentPosition(world, resident, displayTime);
           if (!position) return null;
-          const selected = sameSelection(selection, "resident", resident.id);
-          const focused = sameSelection(focusTarget, "resident", resident.id);
           return (
-            <g
+            <ResidentMarker
               key={resident.id}
-              data-map-entity="resident"
-              data-resident-id={resident.id}
-              role="button"
-              tabIndex={0}
-              aria-label={resident.name}
-              style={{ cursor: layingTrack ? "crosshair" : "pointer" }}
-              onClick={(event) =>
-                selectEntity(event, { kind: "resident", id: resident.id })
-              }
-              onKeyDown={(event) =>
-                selectEntityByKeyboard(event, {
-                  kind: "resident",
-                  id: resident.id,
-                })
-              }
-            >
-              {(selected || focused) && (
-                <circle
-                  cx={position.x}
-                  cy={position.y}
-                  r="0.42"
-                  fill="none"
-                  stroke={selected ? "#d7873f" : "#d19b58"}
-                  strokeWidth="0.12"
-                />
-              )}
-              <circle
-                cx={position.x}
-                cy={position.y}
-                r="0.2"
-                fill={resident.color}
-                stroke="#fffdf7"
-                strokeWidth="0.07"
-              />
-            </g>
+              id={resident.id}
+              name={resident.name}
+              color={resident.color}
+              x={position.x}
+              y={position.y}
+              selected={sameSelection(selection, "resident", resident.id)}
+              focused={sameSelection(focusTarget, "resident", resident.id)}
+              crosshair={layingTrack}
+              onPick={pickEntity}
+              onKey={keyEntity}
+            />
           );
         })}
       </g>
@@ -1434,13 +1523,14 @@ export function MapView({
       <g aria-label="Pods">
         {world.pods.map((pod) => {
           const position = podPosition(world, pod, displayTime);
-          const passenger = pod.plan?.residentId
-            ? world.residents.find(
-                (resident) =>
-                  resident.id === pod.plan?.residentId &&
-                  ["boarding", "riding", "alighting"].includes(resident.status),
-              )
+          const carried = pod.plan?.residentId
+            ? residentsById.get(pod.plan.residentId)
             : undefined;
+          const passenger =
+            carried &&
+            ["boarding", "riding", "alighting"].includes(carried.status)
+              ? carried
+              : undefined;
           const selected = sameSelection(selection, "pod", pod.id);
           const focused = sameSelection(focusTarget, "pod", pod.id);
           return (

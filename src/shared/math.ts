@@ -14,11 +14,17 @@ export function random(world: Pick<World, "rng">): number {
 export const id = (world: World, prefix: string) =>
   `${prefix}${world.nextId++}`;
 export function pathLength(path: Point[]): number {
-  return path.slice(1).reduce((sum, p, i) => sum + distance(path[i], p), 0);
+  let total = 0;
+  for (let index = 1; index < path.length; index += 1)
+    total += Math.hypot(
+      path[index].x - path[index - 1].x,
+      path[index].y - path[index - 1].y,
+    );
+  return total;
 }
 export function alongPath(path: Point[], fraction: number): Point {
   if (!path.length) return { x: 0, y: 0 };
-  let target = pathLength(path) * Math.max(0, Math.min(1, fraction));
+  let target = pathTotalLength(path) * Math.max(0, Math.min(1, fraction));
   for (let i = 1; i < path.length; i++) {
     const d = distance(path[i - 1], path[i]);
     if (target <= d) {
@@ -31,4 +37,17 @@ export function alongPath(path: Point[], fraction: number): Point {
     target -= d;
   }
   return path[path.length - 1];
+}
+
+/**
+ * Cached total length of a stable path array. Animation resamples the same
+ * walk paths every frame, so their length is measured once per array.
+ */
+const pathTotals = new WeakMap<Point[], number>();
+export function pathTotalLength(path: Point[]): number {
+  const cached = pathTotals.get(path);
+  if (cached !== undefined) return cached;
+  const total = pathLength(path);
+  pathTotals.set(path, total);
+  return total;
 }

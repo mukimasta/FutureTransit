@@ -29,6 +29,7 @@ import {
   edgeKey,
   findTrackPath,
   findWalkPath,
+  trackPathLength,
   isBlocked,
   pruneThroughCorridors,
   trackResources,
@@ -53,6 +54,7 @@ import {
   planRelocation,
   planService,
   terminalOwner,
+  terminalOwnerIndex,
 } from "../scheduler";
 import { prepareExpansion } from "../scheduler/expansion";
 import {
@@ -337,21 +339,54 @@ function walkDuration(path: Point[]) {
   return Math.max(1, (pathLength(path) * CELL_METERS) / WALK_METERS_PER_SECOND);
 }
 
+interface StationCandidate {
+  berth: Berth;
+  path: Point[];
+  seconds: number;
+}
+interface StationCache {
+  stamp: string;
+  byBuilding: Map<string, StationCandidate[]>;
+}
+const stationCaches = new WeakMap<World, StationCache>();
+
 /** Bound route-pair work to three walk-reachable stations at each end. */
-function stationCandidates(world: World, building: Building) {
+function stationCandidates(
+  world: World,
+  building: Building,
+): StationCandidate[] {
+  // Departures repeat the same building-to-station question all day long, so
+  // the answer is kept until the network, the map or a pending edit changes it.
+  const stamp = `${world.networkVersion}:${world.berths.length}:${world.buildings.length}:${world.tracks.length}:${world.width}x${world.height}:${world.pendingEdits.map((edit) => edit.id).join(",")}`;
+  let cache = stationCaches.get(world);
+  if (!cache || cache.stamp !== stamp) {
+    cache = { stamp, byBuilding: new Map() };
+    stationCaches.set(world, cache);
+  }
+  const cached = cache.byBuilding.get(building.id);
+  const candidates = cached ?? computeStationCandidates(world, building);
+  if (!cached) cache.byBuilding.set(building.id, candidates);
+  // Access and egress paths are stored on journeys, so hand out private copies.
+  return candidates.map((candidate) => ({
+    ...candidate,
+    path: candidate.path.map((point) => ({ x: point.x, y: point.y })),
+  }));
+}
+
+function computeStationCandidates(
+  world: World,
+  building: Building,
+): StationCandidate[] {
   const door = buildingDoor(building);
+  const pending = new Set(world.pendingEdits.map((edit) => edit.id));
   const ordered = world.berths
-    .filter(
-      (b) =>
-        b.kind === "platform" &&
-        !world.pendingEdits.some((edit) => edit.id === b.id),
-    )
+    .filter((b) => b.kind === "platform" && !pending.has(b.id))
     .sort(
       (a, b) =>
         (a.buildingId === building.id ? -1 : distance(a.point, door)) -
         (b.buildingId === building.id ? -1 : distance(b.point, door)),
     );
-  const candidates: { berth: Berth; path: Point[]; seconds: number }[] = [];
+  const candidates: StationCandidate[] = [];
   for (const berth of ordered) {
     if (berth.buildingId === building.id)
       candidates.push({ berth, path: [], seconds: 0 });
@@ -396,38 +431,49 @@ function beginJourney(world: World, resident: Resident) {
   let unavailable: "no-platform" | "disconnected" | "no-pod" = "no-platform";
   const pickups = stationCandidates(world, origin);
   const dropoffs = stationCandidates(world, destination);
+  // Nearest free Pod and queue length depend on the pickup alone, so both are
+  // resolved once per pickup instead of once per pickup/dropoff pair.
+  const berthsById = new Map(world.berths.map((berth) => [berth.id, berth]));
+  const queuedByPickup = new Map<string, number>();
+  for (const other of world.residents) {
+    const pickupId = other.journey?.pickupId;
+    if (other.status !== "waiting" || !pickupId || other.journey!.podId)
+      continue;
+    queuedByPickup.set(pickupId, (queuedByPickup.get(pickupId) ?? 0) + 1);
+  }
+  const approachSeconds = new Map<string, number>();
+  const emptySecondsFor = (pickup: Berth): number => {
+    const cached = approachSeconds.get(pickup.id);
+    if (cached !== undefined) return cached;
+    let seconds = Infinity;
+    for (const pod of world.pods) {
+      const source = berthsById.get(pod.plan?.finalBerthId ?? pod.berthId!);
+      if (!source) continue;
+      const approach = trackPathLength(world, source.point, pickup.point);
+      if (approach !== null)
+        seconds = Math.min(
+          seconds,
+          Math.max(0, (pod.plan?.end ?? world.time) - world.time) +
+            (approach * CELL_METERS) / POD_METERS_PER_SECOND,
+        );
+    }
+    approachSeconds.set(pickup.id, seconds);
+    return seconds;
+  };
   for (const access of pickups) {
     const pickup = access.berth;
     for (const egress of dropoffs) {
       const dropoff = egress.berth;
       if (pickup.id === dropoff.id) continue;
-      const route = findTrackPath(world, pickup.point, dropoff.point);
+      const route = trackPathLength(world, pickup.point, dropoff.point);
       if (unavailable === "no-platform") unavailable = "disconnected";
-      if (!route) continue;
+      if (route === null) continue;
       unavailable = "no-pod";
-      let emptySeconds = Infinity;
-      for (const pod of world.pods) {
-        const source = world.berths.find(
-          (b) => b.id === (pod.plan?.finalBerthId ?? pod.berthId),
-        );
-        if (!source) continue;
-        const approach = findTrackPath(world, source.point, pickup.point);
-        if (approach)
-          emptySeconds = Math.min(
-            emptySeconds,
-            Math.max(0, (pod.plan?.end ?? world.time) - world.time) +
-              (pathLength(approach) * CELL_METERS) / POD_METERS_PER_SECOND,
-          );
-      }
+      const emptySeconds = emptySecondsFor(pickup);
       if (!Number.isFinite(emptySeconds)) continue;
-      const distanceKm = (pathLength(route) * CELL_METERS) / 1000;
+      const distanceKm = (route * CELL_METERS) / 1000;
       const rideSeconds = (distanceKm * 1000) / POD_METERS_PER_SECOND;
-      const queued = world.residents.filter(
-        (r) =>
-          r.status === "waiting" &&
-          r.journey?.pickupId === pickup.id &&
-          !r.journey.podId,
-      ).length;
+      const queued = queuedByPickup.get(pickup.id) ?? 0;
       const waitSeconds =
         emptySeconds +
         (queued * (rideSeconds + BOARD_SECONDS + ALIGHT_SECONDS)) /
@@ -683,17 +729,19 @@ function touchesPending(world: World, plan: ServicePlan) {
 }
 
 function relocateBlocked(world: World, berthId: string) {
-  const owner = terminalOwner(world, berthId);
+  const owners = terminalOwnerIndex(world);
+  const owner = owners.get(berthId)?.[0];
   const pod = world.pods.find((p) => p.id === owner && !p.plan);
   if (!pod) return false;
   const source = world.berths.find((b) => b.id === berthId);
+  const pending = new Set(world.pendingEdits.map((edit) => edit.id));
   const options = world.berths
     .filter(
       (b) =>
         b.kind === "parking" &&
         b.id !== berthId &&
-        !terminalOwner(world, b.id) &&
-        !world.pendingEdits.some((edit) => edit.id === b.id),
+        !owners.has(b.id) &&
+        !pending.has(b.id),
     )
     .sort(
       (a, b) =>
@@ -718,6 +766,12 @@ function dispatch(world: World) {
       (a, b) =>
         a.journey!.startedAt - b.journey!.startedAt || a.id.localeCompare(b.id),
     );
+  // Dispatch neither adds nor removes berths, buildings or Pods, so one pass
+  // can resolve every id it revisits through these lookups.
+  const berthsById = new Map(world.berths.map((berth) => [berth.id, berth]));
+  const buildingsById = new Map(
+    world.buildings.map((building) => [building.id, building]),
+  );
   for (const resident of waiting) {
     const journey = resident.journey!;
     if (
@@ -727,14 +781,14 @@ function dispatch(world: World) {
       fallbackWalk(world, resident);
       continue;
     }
-    const pickup = world.berths.find((b) => b.id === journey.pickupId);
+    const pickup = journey.pickupId
+      ? berthsById.get(journey.pickupId)
+      : undefined;
     if (!pickup) {
       fallbackWalk(world, resident);
       continue;
     }
-    const destination = world.buildings.find(
-      (b) => b.id === journey.destinationId,
-    )!;
+    const destination = buildingsById.get(journey.destinationId)!;
     const stationOptions = stationCandidates(world, destination).filter(
       (entry) => entry.berth.id !== pickup.id,
     );
@@ -744,11 +798,11 @@ function dispatch(world: World) {
     );
     const loadedSeconds = new Map(
       dropoffs.map((dropoff) => {
-        const path = findTrackPath(world, pickup.point, dropoff.point);
+        const length = trackPathLength(world, pickup.point, dropoff.point);
         return [
           dropoff.id,
-          path
-            ? (pathLength(path) * CELL_METERS) / POD_METERS_PER_SECOND +
+          length !== null
+            ? (length * CELL_METERS) / POD_METERS_PER_SECOND +
               egressSeconds.get(dropoff.id)!
             : Infinity,
         ] as const;
@@ -763,11 +817,11 @@ function dispatch(world: World) {
       const failures = new Set<NonNullable<Journey["waitReason"]>>();
       const idle = reachableIdlePods(world, pickup);
       for (const pod of idle) {
-        const origin = world.berths.find((b) => b.id === pod.berthId)!;
-        const emptyPath = findTrackPath(world, origin.point, pickup.point)!;
+        const origin = berthsById.get(pod.berthId!)!;
+        const emptyLength = trackPathLength(world, origin.point, pickup.point)!;
         const earliestBoardEnd =
           world.time +
-          (pathLength(emptyPath) * CELL_METERS) / POD_METERS_PER_SECOND +
+          (emptyLength * CELL_METERS) / POD_METERS_PER_SECOND +
           BOARD_SECONDS;
         // Sorted reachable candidates may only be skipped once even an empty
         // calendar cannot beat the incumbent. This is a bound, never a cap.
@@ -843,8 +897,13 @@ function dispatch(world: World) {
   }
   // Older saves may contain idle platform residents. Let them leave physically,
   // without teleporting or deleting vehicles, even when nobody is calling here.
-  for (const berth of world.berths.filter((b) => b.kind === "platform")) {
-    const occupant = world.pods.find((p) => p.berthId === berth.id && !p.plan);
+  const idleByBerth = new Map<string, (typeof world.pods)[number]>();
+  for (const pod of world.pods)
+    if (!pod.plan && pod.berthId && !idleByBerth.has(pod.berthId))
+      idleByBerth.set(pod.berthId, pod);
+  for (const berth of world.berths) {
+    if (berth.kind !== "platform") continue;
+    const occupant = idleByBerth.get(berth.id);
     if (occupant && world.time - occupant.parkedSince >= 6)
       relocateBlocked(world, berth.id);
   }
