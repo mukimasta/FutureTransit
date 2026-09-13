@@ -260,6 +260,11 @@ export interface Economy {
   distanceKm?: { loaded: number; empty: number };
 }
 export interface Metrics {
+  trackTraffic?: {
+    since: number;
+    totals: Record<string, number>;
+    buckets: { minute: number; counts: Record<string, number> }[];
+  };
   served: number;
   walked: number;
   savedSeconds: number;

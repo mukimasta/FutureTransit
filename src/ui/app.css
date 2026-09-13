@@ -798,6 +798,59 @@ input:focus-visible {
   box-shadow: 0 10px 28px rgba(55, 53, 47, 0.09);
   backdrop-filter: blur(14px);
 }
+.traffic-panel {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  width: min(280px, calc(100% - 32px));
+  z-index: 5;
+  padding: 14px;
+  border: 1px solid #c7c3b8;
+  border-radius: 10px;
+  background: rgba(250, 248, 242, 0.96);
+  box-shadow: 0 6px 20px #37352f12;
+}
+.traffic-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 10px 0;
+}
+.traffic-tabs button {
+  flex: 1;
+  min-height: 36px;
+  border: 1px solid #cecabe;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.traffic-tabs button[aria-pressed="true"] {
+  background: #2f7773;
+  color: white;
+  border-color: #2f7773;
+}
+.traffic-ramp {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(
+    to right,
+    #5aaba3 0% 25%,
+    #bac05c 25% 50%,
+    #e7a04b 50% 75%,
+    #cd594b 75%
+  );
+}
+.traffic-scale {
+  display: flex;
+  justify-content: space-between;
+  margin: 5px 0 9px;
+  font-size: 12px;
+}
+.traffic-panel small {
+  display: block;
+  color: #6b6b60;
+  font-size: 11px;
+  line-height: 1.6;
+}
 .guide-card.collapsed {
   width: 180px;
 }

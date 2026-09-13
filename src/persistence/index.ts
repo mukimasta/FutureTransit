@@ -927,6 +927,39 @@ export function parseWorld(text: string): World {
   ] as const)
     number(w.economy[key]);
   object(w.metrics);
+  if (w.metrics.trackTraffic === undefined)
+    w.metrics.trackTraffic = { since: w.time, totals: {}, buckets: [] };
+  const traffic = w.metrics.trackTraffic;
+  object(traffic);
+  number(traffic.since, 0, w.time);
+  const trafficIds = new Set(w.tracks.map((t) => t.id));
+  const validateCounts = (counts: Record<string, number>) => {
+    object(counts);
+    check(Object.keys(counts).length <= 12000, "traffic size");
+    for (const [id, count] of Object.entries(counts)) {
+      check(trafficIds.has(id), "traffic track");
+      number(count, 0, Number.MAX_SAFE_INTEGER);
+      check(Number.isInteger(count), "traffic count");
+    }
+  };
+  validateCounts(traffic.totals);
+  array(traffic.buckets, 60);
+  const trafficMinutes = new Set<number>();
+  const recentCounts: Record<string, number> = {};
+  for (const bucket of traffic.buckets) {
+    object(bucket);
+    number(bucket.minute, 0, Math.floor(w.time / 60));
+    check(
+      Number.isInteger(bucket.minute) && !trafficMinutes.has(bucket.minute),
+      "traffic minute",
+    );
+    trafficMinutes.add(bucket.minute);
+    validateCounts(bucket.counts);
+    for (const [id, count] of Object.entries(bucket.counts)) {
+      recentCounts[id] = (recentCounts[id] ?? 0) + count;
+      check(recentCounts[id] <= (traffic.totals[id] ?? 0), "traffic total");
+    }
+  }
   number(w.metrics.served);
   number(w.metrics.walked);
   number(w.metrics.savedSeconds, -1e12);

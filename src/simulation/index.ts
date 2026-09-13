@@ -11,6 +11,7 @@ import type {
   Side,
   World,
 } from "../shared/types";
+import { recordTrackTraffic, forgetTrackTraffic } from "../insights/traffic";
 import {
   ALIGHT_SECONDS,
   BOARD_SECONDS,
@@ -267,6 +268,7 @@ export function createWorld(seed = 7): World {
     reservations: [],
     economy: createEconomy(),
     metrics: {
+      trackTraffic: { since: 0, totals: {}, buckets: [] },
       served: 0,
       walked: 0,
       savedSeconds: 0,
@@ -994,6 +996,7 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
         "Add parking or a connection before splitting this network.",
       );
     world.tracks = candidate.tracks;
+    forgetTrackTraffic(world, [edit.id]);
     book(world, "refund", track.paid);
   } else if (edit.type === "upgrade-track") {
     const track = world.tracks.find((t) => t.id === edit.id);
@@ -1108,6 +1111,7 @@ export function stepWorld(world: World, seconds: number): void {
   while (world.time < end) {
     const dt = Math.min(1, end - world.time);
     world.time += dt;
+    recordTrackTraffic(world, world.time - dt);
     updatePods(world, dt);
     for (const resident of world.residents) {
       if (resident.status === "inside" && resident.nextDeparture <= world.time)
@@ -1533,6 +1537,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
         (track) => !immediateIds.has(track.id),
       );
       book(world, "refund", refund);
+      forgetTrackTraffic(world, immediateIds);
       world.networkVersion++;
       pruneThroughCorridors(world);
     }

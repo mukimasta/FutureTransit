@@ -45,6 +45,7 @@ import {
   parkingShortage,
 } from "../simulation/fleet";
 import { buildingFlow, type FlowMode } from "../insights";
+import { trackTraffic, type TrafficRange } from "../insights/traffic";
 import { distance } from "../shared/math";
 import {
   parseWorld,
@@ -218,6 +219,17 @@ export default function App() {
   const [language, setLanguage] = useState<Language>("zh");
   const [tool, setTool] = useState<Tool>("view");
   const [layer, setLayer] = useState<"life" | "flow">("life");
+  const [trafficRange, setTrafficRange] = useState<TrafficRange>("recent");
+  const recentTraffic = useMemo(
+    () => (world ? trackTraffic(world, "recent") : {}),
+    [world],
+  );
+  const totalTraffic = world?.metrics.trackTraffic?.totals ?? {};
+  const trafficCounts = trafficRange === "total" ? totalTraffic : recentTraffic;
+  const trafficMax = Math.max(
+    0,
+    ...(world?.tracks ?? []).map((t) => trafficCounts[t.id] ?? 0),
+  );
   const [selection, setSelection] = useState<Selection>(null);
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [residentRosterOpen, setResidentRosterOpen] = useState(false);
@@ -1602,6 +1614,12 @@ export default function App() {
         </SectionTitle>
         <p className="flow-legend">
           {tx(
+            `当前小段：累计 ${totalTraffic[track.id] ?? 0} 次 · 近 1 小时 ${recentTraffic[track.id] ?? 0} 次`,
+            `This cell: ${totalTraffic[track.id] ?? 0} total · ${recentTraffic[track.id] ?? 0} in last hour`,
+          )}
+        </p>
+        <p className="flow-legend">
+          {tx(
             `已选 ${picked.length} 个小段 · 车道双向共享`,
             `Selected ${picked.length} cells · all lanes shared both ways`,
           )}
@@ -1951,6 +1969,61 @@ export default function App() {
         </nav>
 
         <section className="map-stage">
+          {layer === "flow" && (
+            <aside
+              className="traffic-panel"
+              aria-label={tx("轨道流量", "Track traffic")}
+            >
+              <strong>{tx("轨道流量", "Track traffic")}</strong>
+              <div className="traffic-tabs">
+                {(["recent", "total"] as const).map((range) => (
+                  <button
+                    key={range}
+                    type="button"
+                    aria-pressed={trafficRange === range}
+                    onClick={() => setTrafficRange(range)}
+                  >
+                    {range === "recent"
+                      ? tx("最近 1 小时", "Last hour")
+                      : tx("累计", "All time")}
+                  </button>
+                ))}
+              </div>
+              <div className="traffic-ramp" />
+              <div className="traffic-scale">
+                <span>0</span>
+                <span>
+                  {tx(`${trafficMax} 次 / 小段`, `${trafficMax} passes / cell`)}
+                </span>
+              </div>
+              <small>
+                {tx(
+                  "载客 + 空车，双向合计；灰色 = 0",
+                  "Loaded + empty, both ways; gray = 0",
+                )}
+              </small>
+              <small>
+                {tx(
+                  "最近 60 个城市分钟，含当前分钟",
+                  "Last 60 city-minute buckets, including this minute",
+                )}
+              </small>
+              <small>
+                {tx(
+                  `已记录 ${Math.floor((world.time - (world.metrics.trackTraffic?.since ?? world.time)) / 60)} 分钟 · 旧历史无法补回`,
+                  `${Math.floor((world.time - (world.metrics.trackTraffic?.since ?? world.time)) / 60)} minutes recorded · older history unavailable`,
+                )}
+              </small>
+              <small>
+                {trafficMax === 0
+                  ? tx("暂无通过记录", "No recorded passes")
+                  : tx(
+                      "点击轨道查看次数 · 色阶随当前最高值变化",
+                      "Click a track for counts · colors relative to current maximum",
+                    )}
+              </small>
+            </aside>
+          )}
           <MapView
             world={world}
             selection={selection}
@@ -1974,6 +2047,8 @@ export default function App() {
             }
             onFinishDraft={finishDraft}
             layer={layer}
+            trafficCounts={trafficCounts}
+            trafficMax={trafficMax}
             language={language}
             focusTarget={focusTarget}
             selectedTrackIds={
@@ -2028,7 +2103,7 @@ export default function App() {
             </button>
           )}
 
-          {!guideDismissed && (
+          {!guideDismissed && layer !== "flow" && (
             <aside className={`guide-card${guideOpen ? "" : " collapsed"}`}>
               <button
                 className="guide-title"

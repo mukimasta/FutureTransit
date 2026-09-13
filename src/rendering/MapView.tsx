@@ -11,12 +11,8 @@ import {
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
-import {
-  buildingDoor,
-  trackResources,
-  nodeKey,
-  tracePolyline,
-} from "../network";
+import { buildingDoor, nodeKey, tracePolyline } from "../network";
+import { trafficColor } from "../insights/traffic";
 import { RenderClock } from "../shared/render-clock";
 import { podPosition, residentPosition } from "../shared/selectors";
 import type {
@@ -215,8 +211,6 @@ function buildingRect(building: Building) {
   };
 }
 
-const EMPTY_TRACK_IDS: ReadonlySet<string> = new Set<string>();
-
 /**
  * A waiting Resident's dot is a pure function of the world snapshot, so it is
  * only rebuilt when one of these values actually moves. Rush hour parks
@@ -337,6 +331,8 @@ export function MapView({
   candidateInvalid,
   onFinishDraft,
   layer,
+  trafficCounts,
+  trafficMax,
   language,
   focusTarget,
   selectedTrackIds = [],
@@ -745,21 +741,6 @@ export function MapView({
       ? residentsById.get(focusTarget.id)
       : undefined;
   const trackedBuildingId = trackedEntity?.atBuildingId;
-  const activeTracks = useMemo(() => {
-    if (layer !== "flow") return EMPTY_TRACK_IDS;
-    const resources = new Set(
-      world.reservations
-        .filter((item) => item.start <= displayTime && displayTime < item.end)
-        .map((item) => item.resource),
-    );
-    return new Set(
-      world.tracks
-        .filter((track) =>
-          trackResources(world, track).some((key) => resources.has(key)),
-        )
-        .map((track) => track.id),
-    );
-  }, [displayTime, layer, world.reservations, world.tracks]);
 
   const highlightPath = (target: Selection | undefined): Point[] => {
     if (!target) return [];
@@ -1164,22 +1145,20 @@ export function MapView({
             pointerEvents="none"
           />
         ))}
-        {world.tracks
-          .filter((track) => activeTracks.has(track.id))
-          .map((track) => (
-            <line
-              key={`active-${track.id}`}
-              x1={track.a.x}
-              y1={track.a.y}
-              x2={track.b.x}
-              y2={track.b.y}
-              stroke="#2f7773"
-              strokeWidth="0.12"
-              strokeLinecap="round"
-              pointerEvents="none"
-              opacity="0.9"
-            />
-          ))}
+        {(layer === "flow" ? world.tracks : []).map((track) => (
+          <line
+            key={`active-${track.id}`}
+            x1={track.a.x}
+            y1={track.a.y}
+            x2={track.b.x}
+            y2={track.b.y}
+            stroke={trafficColor(trafficCounts[track.id] ?? 0, trafficMax)}
+            strokeWidth="0.24"
+            strokeLinecap="round"
+            pointerEvents="none"
+            opacity="0.9"
+          />
+        ))}
         {world.tracks.map((track) => (
           <g
             key={track.id}

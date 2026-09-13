@@ -37,6 +37,8 @@ export interface MapViewProps {
   candidateInvalid: boolean;
   onFinishDraft: () => void;
   layer: "life" | "flow";
+  trafficCounts: Record<string, number>;
+  trafficMax: number;
   language: Language;
   focusTarget?: Selection;
   selectedTrackIds?: string[];
