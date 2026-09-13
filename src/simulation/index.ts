@@ -1200,7 +1200,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
     );
   }
   if (command.type === "speed") {
-    if (![1, 2, 4].includes(command.value))
+    if (![1, 2, 4, 8].includes(command.value))
       return result(false, "无效速度。", "Invalid speed.");
     world.speed = command.value;
     return result(true, `${command.value} 倍速`, `${command.value}× speed`);

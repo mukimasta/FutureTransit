@@ -26,8 +26,8 @@ describe("candidate track previews", () => {
   });
 });
 describe("minute presentation clock", () => {
-  it("advances one displayed minute every two real seconds at 1x", () => {
-    expect(TIME_SCALE * 2).toBe(60);
+  it("advances one displayed minute every four real seconds at 1x", () => {
+    expect(TIME_SCALE * 4).toBe(60);
     expect(formatClock(59)).toBe("07:00");
     expect(formatClock(60)).toBe("07:01");
     expect(formatClock(599)).toBe("07:09");

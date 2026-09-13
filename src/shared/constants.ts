@@ -2,9 +2,9 @@
 export const CELL_METERS = 40;
 export const WALK_METERS_PER_SECOND = 1.3;
 export const POD_METERS_PER_SECOND = 8;
-// One city minute takes two real seconds at 1x. Physics still
+// One city minute takes four real seconds at 1x. Physics still
 // advances in one-second steps and rendering interpolates between snapshots.
-export const TIME_SCALE = 30;
+export const TIME_SCALE = 15;
 export const BOARD_SECONDS = 9;
 export const ALIGHT_SECONDS = 6;
 export const NODE_SECONDS = 1;

@@ -287,7 +287,7 @@ describe("continuous Pod motion", () => {
 });
 
 describe("render clock", () => {
-  for (const speed of [1, 2, 4] as const) {
+  for (const speed of [1, 2, 4, 8] as const) {
     it(`stays smooth and monotonic across integer snapshots at ${speed}x`, () => {
       const clock = new RenderClock(0, false, speed, 0);
       let previous = 0;

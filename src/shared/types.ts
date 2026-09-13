@@ -309,7 +309,7 @@ export interface World {
   rng: number;
   time: number;
   paused: boolean;
-  speed: 1 | 2 | 4;
+  speed: 1 | 2 | 4 | 8;
   width: number;
   height: number;
   nextId: number;
@@ -333,7 +333,7 @@ export type Command =
   | { type: "repay-loan" }
   | { type: "pause"; value: boolean }
   | { type: "toggle-pause" }
-  | { type: "speed"; value: 1 | 2 | 4 }
+  | { type: "speed"; value: 1 | 2 | 4 | 8 }
   | { type: "build-track"; points: Point[] }
   | { type: "add-platform"; buildingId?: string; point?: Point; side: Side }
   | { type: "add-parking"; point: Point; side: Side }

@@ -179,7 +179,7 @@ export function parseWorld(text: string): World {
     "invalid map size",
   );
   check(
-    typeof w.paused === "boolean" && [1, 2, 4].includes(w.speed),
+    typeof w.paused === "boolean" && [1, 2, 4, 8].includes(w.speed),
     "invalid clock",
   );
   array(w.buildings, MAX_BUILDINGS);

@@ -1738,8 +1738,8 @@ export default function App() {
           <span
             className="sim-time"
             title={tx(
-              "每 2 秒现实时间推进 1 分钟（1×）；车辆连续运行",
-              "1 city minute per 2 real seconds at 1x; continuous traffic",
+              "每 4 秒现实时间推进 1 分钟（1×）；车辆连续运行",
+              "1 city minute per 4 real seconds at 1x; continuous traffic",
             )}
           >
             <small>
@@ -1768,7 +1768,7 @@ export default function App() {
           >
             {world.paused ? <Play size={15} /> : <Pause size={15} />}
           </button>
-          {([1, 2, 4] as const).map((speed) => (
+          {([1, 2, 4, 8] as const).map((speed) => (
             <button
               className={`speed-button${world.speed === speed ? " is-active" : ""}`}
               type="button"
