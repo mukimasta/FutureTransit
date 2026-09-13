@@ -287,6 +287,61 @@ describe("dispatch around a busy route", () => {
     );
   });
 
+  it("splits the same answer across the direct and diverted waves", () => {
+    const w = boundedWorld();
+    const { pickup, dropoff } = platforms(w);
+    const blocked = w.tracks.find((t) => t.a.x === 6 && t.a.y === 2)!;
+    w.reservations = trackResources(w, blocked).map((resource) => ({
+      resource,
+      ownerId: "busy",
+      start: 0,
+      end: 10_000,
+    }));
+    // Dispatch asks for the direct pairing first and holds the ways round
+    // back, so the two scopes together have to cover what one call covered.
+    const direct = planService(
+      w,
+      w.pods[0],
+      resident("r"),
+      pickup,
+      dropoff,
+      Infinity,
+      "direct",
+    );
+    expect(direct.ok).toBe(false);
+    const diverted = planService(
+      w,
+      w.pods[0],
+      resident("r"),
+      pickup,
+      dropoff,
+      Infinity,
+      "detours",
+    );
+    const both = planService(w, w.pods[0], resident("r"), pickup, dropoff);
+    expect(diverted.ok).toBe(true);
+    expect(both.ok).toBe(true);
+    if (diverted.ok && both.ok)
+      expect(diverted.plan.dropoffEnd).toBe(both.plan.dropoffEnd);
+  });
+
+  it("keeps parking within the nearest bays it weighs", () => {
+    const w = ladder();
+    // Far more bays than a plan may weigh, all reachable from the drop-off.
+    for (let index = 0; index < 20; index += 1) {
+      w.berths.push(
+        berth(`F${index}`, "parking", [index + 1, -1], [index + 1, 0]),
+      );
+      w.tracks.push(track([index + 1, 0], [index + 1, 1]));
+      w.tracks.push(track([index + 1, 1], [index + 1, 2]));
+    }
+    w.networkVersion += 1;
+    const { pickup, dropoff } = platforms(w);
+    const plan = planService(w, w.pods[0], resident("r"), pickup, dropoff);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(() => commitPlan(w, plan.plan)).not.toThrow();
+  });
+
   it("offers the longer way round only where the rails provide one", () => {
     const { pickup, dropoff } = platforms(ladder());
     expect(

@@ -1,4 +1,72 @@
-# Peak-load optimization — MVP v0.0.11
+# Peak-load optimization — MVP v0.0.12
+
+## v0.0.12 morning dispatch: stop re-proving the impossible
+
+Input: `future-transit-7-0911.json`, city time 526311, 736 residents, 147 Pods (51 idle), 1,010 tracks, 304 berths (82 platforms, 222 parking) and 20,831 reservations. 467 of the tracks carry three lanes. Baseline is `cb07063` (v0.0.11).
+
+### What the morning was actually spending on
+
+Measured on the baseline: a dispatch pass ran every 3 city seconds and cost ~4,250 ms. It handled **2.8 requests** and made **394 service computations**, of which **3 succeeded**. Every one of the 2,362 failures returned `track-busy`, and every one of the 36,918 departure searches inside them ended by running out of planning window rather than by hitting a held resource: plans on this map run 900–1,350 seconds, leaving 450–900 seconds of slack in the 1,800-second window, and congestion consumed it. The city was not short of Pods — 96 were mid-journey and 51 idle. It was short of room, for a handful of people, and it re-derived that for the whole fleet several times a minute.
+
+Two negative results came first and are recorded because they cost measurement time:
+
+- A fleet-wide feasibility gate on the ride alone (board, loaded run, alight), scanned against a calendar with every idle Pod's own holds removed — a strict subset of every idle Pod's calendar, so anything it refuses none of them can accept. Sound, and it **never fired**: the rides fit; the empty run and the park after them are what did not. Adding the shortest possible parking leg to the bound moved its median from 1,546 to 1,718 seconds against an 1,800-second window, still under. It cost more than it saved (4,517 ms vs 4,174 ms over 60 city seconds) and was removed.
+- Gating detours on the resources that held the shortest route up, in either the loose form or the form that only counts blockers on the leg being replaced. Both passed **every** detour: in a jam the blocker set spans the whole route and any other way round avoids some of it.
+
+### Changes
+
+- **Two dispatch waves.** The fleet is asked with shortest routes first. Ways round are offered afterwards, to the three most promising pairings, and only where the direct wave found nothing or found a plan more than 60 seconds worse than free-flow. `planService` takes a route scope (`all`, `direct`, `detours`); `detours` resumes at the second pairing because the first was already priced under a deadline no looser. Detour generation, the three lane profiles and the single-leg-at-a-time rule are unchanged.
+- **Candidate quotas.** One request prices at most 12 Pod/station pairings directly plus 3 diverted; one pass prices at most 24 before leaving the rest to the next pass, three city seconds later. Ordering is still by optimistic door-to-door arrival and the queue still runs longest-waiting first, so a deferred request keeps its place. Measured on this save: of 17 direct-wave successes, 11 came from the first pairing, 14 from the first three, and none from beyond the eighth.
+- **Terminal cap.** A service weighs the 12 parking berths nearest the drop-off, plus the berth the Pod already occupies. This is what removed the worst individual calls: before it, a single plan could walk all 76 usable bays for 152 searches and 228 templates, 75 ms in one call. Of 23 committed plans, 21 parked at the nearest bay, one at the third and one at the ninth.
+- **Reason-aware retry.** A request waiting on a Pod (`no-pod`, `disconnected`) still wakes the moment the idle fleet moves. A request waiting on a corridor or a parking row does not: another Pod parking across the city leaves the jam as it was, and waking every such request on every arrival is what made the baseline re-price the fleet on almost every pass. Those wake on the clock, on the network version and on pending edits. The interval is 20 city seconds plus a per-request spread of up to 20 more, so requests that failed together do not all return in the same pass.
+- **Openings keyed by geometry.** What a service owes up to the moment the passenger steps out cannot see past the alighting dwell, so it is now cached on the two legs, the two platforms and the lane instead of on one terminal's segment array — shared across terminals, across both waves, and across every Pod and request that takes the same legs.
+- **Calendars read through.** A Pod's calendar is the shared table plus its own differences, rather than a copy of a table with thousands of entries per query.
+
+### Measurements
+
+240 city seconds, `node scripts/benchmark-service.mjs`:
+
+|                                    | v0.0.11                     | v0.0.12                     |
+| ---------------------------------- | --------------------------- | --------------------------- |
+| simulation                         | 122,994 ms                  | 2,387 ms                    |
+| per city second                    | 512.5 ms                    | 9.9 ms                      |
+| worst step                         | 5,551 ms                    | 302 ms                      |
+| p90 / p99 step                     | 1,896 / 5,360 ms            | 35 / 106 ms                 |
+| steps over 66 ms                   | 41 of 240                   | 13 of 240                   |
+| journeys completed by Pod          | 26                          | 26                          |
+| journeys that fell back to walking | 4                           | 4                           |
+| wait mean / p50 / p90 / max        | 283.5 / 305 / 518.8 / 530 s | 283.5 / 305 / 518.8 / 530 s |
+| riding at the end                  | 39                          | 39                          |
+| unassigned waiting at the end      | 3                           | 4                           |
+
+Every passenger-visible figure but the last two is identical: over four city minutes the quotas and the cap never changed a dispatch decision on this save. The two that differ are one resident and one Pod at the sampling instant.
+
+120 city seconds through `node scripts/benchmark-peak.mjs`: 1,570 ms, worst step 307 ms, P95 81 ms, 12 deliveries, lossless delta reconstruction and final-save trajectory validation both passing.
+
+### What this does and does not claim about 1×
+
+At 1× the worker advances 1.5 city seconds per 100 ms tick, so the sustainable cost is about 60 ms per city second once delta capture (6.1 ms per frame here) is paid. This save now averages 9.9 ms per city second, about a sixth of that. It is not uniform: dispatch runs every 3 city seconds and carries essentially all of the cost, so a dispatch pass of 35–106 ms lands inside one tick every second or two. Loading a jammed save and pressing play still costs one pass of ~300 ms, with every cache cold and every waiting request due at once.
+
+This is a simulation-cost measurement in Node. It is not a browser frame rate, and 8× remains several times over budget on a city this size.
+
+### Reproduce
+
+```
+node scripts/benchmark-peak.mjs /path/to/save.json 120     # simulation and worker deltas
+node scripts/benchmark-service.mjs /path/to/save.json 240  # what the passengers got
+node scripts/audit-service-pruning.mjs                     # differential pruning audit
+```
+
+Both runners read the supplied save and never write it. `benchmark-service.mjs` advances a separate in-memory city and reports completed journeys, walking fallbacks and the wait distribution alongside the step timings, so a speed change can be checked against what it cost the passengers.
+
+### Verification
+
+- Full suite: 168 passed, one known pre-existing failure in `adversarial.test.ts` (detailed below) that also fails on unmodified `cb07063`.
+- New regressions: the direct and diverted waves together reproduce what one unscoped call produced on a blocked corridor, and a service still plans and commits where the drop-off has far more parking bays than it may weigh.
+- `node scripts/audit-service-pruning.mjs` still passes on all 48 Pod cases. Note what it now covers: it rewrites `computeService`, so it certifies that the internal arrival, floor and cutoff pruning is exact **for the candidate set it is given**. The terminal cap and the dispatch quotas sit outside that function and apply to both bundles, so the audit no longer certifies the candidate set is exhaustive. Those are deliberate trades, and the evidence for them is the service comparison above plus the measured win distributions, not a proof.
+- Type checking and the production build pass.
+
+## v0.0.11 retained measurement record
 
 ## v0.0.11 morning dispatch: proof-based pruning
 

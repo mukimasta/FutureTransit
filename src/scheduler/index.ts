@@ -37,6 +37,15 @@ import {
 
 const PLANNING_WINDOW_SECONDS = 1_800;
 const MAX_SEARCH_STEPS = 4_096;
+/**
+ * How many parking berths a service weighs, nearest to the drop-off first.
+ *
+ * A Pod parks where it finishes; a bay on the far side of the city costs empty
+ * running nobody is paid for, and in a city with hundreds of bays, pricing them
+ * all is most of the work a request that finds nothing ever does. Measured on a
+ * congested morning, every plan that was found parked within the first nine.
+ */
+const MAX_SERVICE_TERMINALS = 12;
 const EPSILON = 1e-9;
 const BERTH_RESOURCE_PREFIX = "berth:";
 
@@ -65,6 +74,7 @@ interface GeometryCache {
   berths: Berth[];
   paths: Map<string, Point[][]>;
   templates: Map<string, ReturnType<typeof computeServiceTemplate>>;
+  openings: Map<string, RelativeReservation[]>;
 }
 const geometryCaches = new WeakMap<World, GeometryCache>();
 const pathIds = new WeakMap<Point[], number>();
@@ -142,6 +152,7 @@ function geometryCache(world: World): GeometryCache {
       berths: world.berths,
       paths: new Map(),
       templates: new Map(),
+      openings: new Map(),
     };
     geometryCaches.set(world, cache);
   }
@@ -224,6 +235,9 @@ function relieves(blockers: Set<string>, footprint: Set<string>): boolean {
   for (const blocker of blockers) if (!footprint.has(blocker)) return true;
   return false;
 }
+
+/** Which of a leg's ways round a caller is asking about. */
+export type RouteScope = "all" | "direct" | "detours";
 
 interface RouteVariant {
   emptyPath: Point[];
@@ -553,6 +567,29 @@ interface ResourceCalendar {
   runningEnd: Float64Array;
 }
 
+/**
+ * What one Pod has to fit into: everything the city holds, minus its own.
+ *
+ * Every idle Pod reads the same few thousand resources and differs on the
+ * handful it wrote itself, so the shared table is read through rather than
+ * copied once per query. An entry in `own` overrides the shared one; `null`
+ * there means the Pod was the only claimant and the resource is free to it.
+ */
+interface Calendars {
+  own: Map<string, ResourceCalendar | null>;
+  shared: Map<string, ResourceCalendar>;
+}
+
+function calendarFor(
+  calendars: Calendars,
+  resource: string,
+): ResourceCalendar | undefined {
+  const own = calendars.own.get(resource);
+  return own !== undefined
+    ? (own ?? undefined)
+    : calendars.shared.get(resource);
+}
+
 /** The furthest end among blocks that start before `limit`, or -Infinity. */
 function latestEndBefore(calendar: ResourceCalendar, limit: number): number {
   const starts = calendar.starts;
@@ -584,13 +621,14 @@ interface CalendarCache {
   pendingIds: string[];
   time: number;
   stamp: (string | number | null | undefined)[];
-  byPod: Map<string, Map<string, ResourceCalendar>>;
+  byPod: Map<string, Calendars>;
   byService: Map<string, ServiceOutcome>;
   owners?: Map<string, string[]>;
   shared?: Map<string, ResourceCalendar>;
   blocksByResource?: Map<string, TimedBlock[]>;
   ownedResources?: Map<string, Set<string>>;
   parking?: Map<string, number>;
+  berthById?: Map<string, Berth>;
 }
 
 /**
@@ -688,10 +726,15 @@ function planningCache(world: World): CalendarCache {
   return fresh;
 }
 
-function blockedResources(
-  world: World,
-  podId: string,
-): Map<string, ResourceCalendar> {
+/** Every berth by id, for one planning state. */
+function berthIndex(world: World): Map<string, Berth> {
+  const cache = planningCache(world);
+  if (!cache.berthById)
+    cache.berthById = new Map(world.berths.map((berth) => [berth.id, berth]));
+  return cache.berthById;
+}
+
+function blockedResources(world: World, podId: string): Calendars {
   const cache = planningCache(world);
   const cached = cache.byPod.get(podId);
   if (cached) return cached;
@@ -711,14 +754,17 @@ function blockedResources(
     }
   }
   // Share every unaffected calendar; remove only this Pod's own commitments.
-  const calendars = new Map(cache.shared);
+  const own = new Map<string, ResourceCalendar | null>();
   for (const resource of cache.ownedResources!.get(podId) ?? []) {
     const others = cache
       .blocksByResource!.get(resource)!
       .filter((block) => block.ownerId !== podId);
-    if (!others.length) calendars.delete(resource);
-    else calendars.set(resource, buildCalendars(others).get(resource)!);
+    own.set(
+      resource,
+      others.length ? buildCalendars(others).get(resource)! : null,
+    );
   }
+  const calendars: Calendars = { own, shared: cache.shared! };
   cache.byPod.set(podId, calendars);
   return calendars;
 }
@@ -838,11 +884,11 @@ interface WindowScan {
  */
 function beginScan(
   windows: RelativeReservation[],
-  calendars: Map<string, ResourceCalendar>,
+  calendars: Calendars,
 ): WindowScan {
   const contested: WindowScan["contested"] = [];
   for (const proposed of windows) {
-    const calendar = calendars.get(proposed.resource);
+    const calendar = calendarFor(calendars, proposed.resource);
     if (calendar?.starts.length) contested.push({ window: proposed, calendar });
   }
   return {
@@ -908,9 +954,7 @@ function scanDeparture(scan: WindowScan, departure: number): number {
 
 /** What is known about when a shared opening can be left. */
 type OpeningBound =
-  | { kind: "clears"; at: number }
-  | { kind: "never" }
-  | { kind: "unknown" };
+  { kind: "clears"; at: number } | { kind: "never" } | { kind: "unknown" };
 
 /**
  * The soonest a shared opening could be left, whatever a candidate does after.
@@ -929,7 +973,7 @@ type OpeningBound =
 function openingFloor(
   world: World,
   opening: RelativeReservation[],
-  calendars: Map<string, ResourceCalendar>,
+  calendars: Calendars,
   blockers?: Set<string>,
 ): OpeningBound {
   const scan = beginScan(opening, calendars);
@@ -957,7 +1001,7 @@ function searchDeparture(
   origin: Berth,
   finalBerth: Berth,
   template: MotionSegment[],
-  calendars: Map<string, ResourceCalendar>,
+  calendars: Calendars,
   prefix: RelativeReservation[],
   prefixLength: number,
   floor: number,
@@ -977,7 +1021,7 @@ function searchDeparture(
   let departure = Math.max(world.time, floor);
 
   const scan = beginScan(relative, calendars);
-  const finalCalendar = calendars.get(berthResource(finalBerth.id));
+  const finalCalendar = calendarFor(calendars, berthResource(finalBerth.id));
   const finalEnd = finalCalendar?.starts.length
     ? finalCalendar.runningEnd[finalCalendar.starts.length - 1]
     : Number.NEGATIVE_INFINITY;
@@ -1026,7 +1070,7 @@ function searchDeparture(
             end: window.end + departure,
           });
         }
-        const calendar = calendars.get(resource);
+        const calendar = calendarFor(calendars, resource);
         if (calendar) {
           for (const reservation of mergeRelativeReservations(held)) {
             const blockedUntil = latestEndBefore(
@@ -1081,11 +1125,13 @@ function serviceTerminalCandidates(
         left.distance - right.distance ||
         left.berth.id.localeCompare(right.berth.id),
     );
-  for (const candidate of nearbyParking) add(candidate.berth);
-  add(origin);
-  for (const berth of world.berths) {
-    if (berth.kind === "parking") add(berth);
+  for (const candidate of nearbyParking) {
+    add(candidate.berth);
+    if (candidates.length >= MAX_SERVICE_TERMINALS) break;
   }
+  // Where the Pod already stands is always worth keeping, however far out the
+  // drop-off leaves it: it is the one berth nothing else can be holding.
+  add(origin);
   return candidates;
 }
 
@@ -1125,11 +1171,27 @@ function serviceTemplate(
   return template;
 }
 
+/**
+ * What a service owes up to the moment the passenger steps out.
+ *
+ * The terminal is chosen after all of this has already happened, and nothing
+ * inside the opening can see past the alighting dwell, so every terminal that
+ * shares the two legs and the lane shares this list as well — including the
+ * ones a later request, or a later Pod, asks about. It is geometry, so it
+ * outlives the reservations it will be weighed against.
+ */
 function openingReservations(
   world: World,
+  emptyPath: Point[],
+  loadedPath: Point[],
+  pickup: Berth,
+  dropoff: Berth,
+  laneProfile: number,
   template: ReturnType<typeof serviceTemplate>,
 ): RelativeReservation[] {
-  const cached = compiledOpenings.get(template.segments);
+  const cache = geometryCache(world);
+  const key = `${pathId(emptyPath)}:${pathId(loadedPath)}:${pickup.id}:${dropoff.id}:${laneProfile}`;
+  const cached = cache.openings.get(key);
   if (cached) return cached;
   const opening = mergeTrajectoryWindows(
     trajectoryWindowRange(
@@ -1140,7 +1202,9 @@ function openingReservations(
       1,
     ),
   );
-  compiledOpenings.set(template.segments, opening);
+  if (cache.openings.size >= 2048)
+    cache.openings.delete(cache.openings.keys().next().value!);
+  cache.openings.set(key, opening);
   return opening;
 }
 
@@ -1238,12 +1302,20 @@ export function planService(
   pickup: Berth,
   dropoff: Berth,
   latestArrival = Infinity,
+  routes: RouteScope = "all",
 ): PlanResult {
   const cache = planningCache(world);
-  const key = `${pod.id}\u0000${pickup.id}\u0000${dropoff.id}\u0000${latestArrival}`;
+  const key = `${pod.id}\u0000${pickup.id}\u0000${dropoff.id}\u0000${latestArrival}\u0000${routes}`;
   let outcome = cache.byService.get(key);
   if (!outcome) {
-    outcome = computeService(world, pod, pickup, dropoff, latestArrival);
+    outcome = computeService(
+      world,
+      pod,
+      pickup,
+      dropoff,
+      latestArrival,
+      routes,
+    );
     cache.byService.set(key, outcome);
   }
   if (!outcome.ok) return { ok: false, reason: outcome.reason };
@@ -1280,11 +1352,13 @@ function computeService(
   pickup: Berth,
   dropoff: Berth,
   latestArrival: number,
+  routes: RouteScope = "all",
 ): ServiceOutcome {
   const podFailure = idlePodFailure(pod);
   if (podFailure) return podFailure;
-  const actualPickup = world.berths.find((berth) => berth.id === pickup.id);
-  const actualDropoff = world.berths.find((berth) => berth.id === dropoff.id);
+  const berths = berthIndex(world);
+  const actualPickup = berths.get(pickup.id);
+  const actualDropoff = berths.get(dropoff.id);
   if (
     !actualPickup ||
     !actualDropoff ||
@@ -1293,7 +1367,7 @@ function computeService(
   ) {
     return { ok: false, reason: "no-platform" };
   }
-  const origin = world.berths.find((berth) => berth.id === pod.berthId);
+  const origin = pod.berthId ? berths.get(pod.berthId) : undefined;
   if (!origin) return { ok: false, reason: "no-pod" };
   if (
     world.pendingEdits.some((edit) =>
@@ -1340,8 +1414,13 @@ function computeService(
     | undefined;
   const calendars = blockedResources(world, pod.id);
   const variants = routeVariants(emptyRoutes, loadedRoutes);
+  // "detours" resumes where "direct" stopped: the shortest pairing has already
+  // been priced under a deadline no looser than this one, so pricing it twice
+  // can only return the same answer.
+  const first = routes === "detours" ? 1 : 0;
+  const last = routes === "direct" ? 1 : variants.length;
   const blockers = new Set<string>();
-  for (let variant = 0; variant < variants.length; variant += 1) {
+  for (let variant = first; variant < last; variant += 1) {
     const { emptyPath, loadedPath } = variants[variant];
     const duration =
       travelSeconds(emptyPath) +
@@ -1385,7 +1464,15 @@ function computeService(
         // asked for it, and a floor is only a floor once they all have one.
         let opening = openings[laneProfile];
         if (!opening) {
-          opening = openingReservations(world, template);
+          opening = openingReservations(
+            world,
+            emptyPath,
+            loadedPath,
+            actualPickup,
+            actualDropoff,
+            laneProfile,
+            template,
+          );
           openings[laneProfile] = opening;
           // A shared prefix floor earns its scan by pruning later terminals.
           // With only one terminal, the full departure scan suffices.

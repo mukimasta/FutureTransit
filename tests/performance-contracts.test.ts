@@ -68,23 +68,29 @@ describe("demand retry events", () => {
     await stepWorldAsync(b, 180, async () => {});
     expect(b).toEqual(a);
   });
-  it("sleeps failures, wakes on fleet/topology changes, and bounds retries to 30 city seconds", () => {
+  it("sleeps a jammed request on the clock, a Pod-less one on the fleet, and both on topology", () => {
     const w = createWorld(),
       queue = new RetryQueue();
     queue.refresh(w);
-    queue.failed("ride", w.time);
-    w.time += 3;
+    queue.failed("ride", w.time, "track-busy");
+    w.time += 19;
     queue.refresh(w);
     expect(queue.ready("ride", w.time)).toBe(false);
-    w.time += 27;
-    queue.refresh(w);
-    expect(queue.ready("ride", w.time)).toBe(true);
-    queue.failed("ride", w.time);
-    w.networkVersion++;
-    queue.refresh(w);
-    expect(queue.ready("ride", w.time)).toBe(true);
-    queue.failed("ride", w.time);
+    // A Pod parking elsewhere leaves a busy corridor exactly as it was.
     w.pods[0].berthId = "changed";
+    queue.refresh(w);
+    expect(queue.ready("ride", w.time)).toBe(false);
+    // The spread puts every request back within 40 city seconds regardless.
+    w.time += 21;
+    queue.refresh(w);
+    expect(queue.ready("ride", w.time)).toBe(true);
+    // Waiting on a Pod is waiting on the fleet, and wakes with it.
+    queue.failed("ride", w.time, "no-pod");
+    w.pods[0].berthId = "changed again";
+    queue.refresh(w);
+    expect(queue.ready("ride", w.time)).toBe(true);
+    queue.failed("ride", w.time, "track-busy");
+    w.networkVersion++;
     queue.refresh(w);
     expect(queue.ready("ride", w.time)).toBe(true);
   });

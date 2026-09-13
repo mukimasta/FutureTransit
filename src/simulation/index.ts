@@ -763,6 +763,23 @@ function relocateBlocked(world: World, berthId: string) {
   return false;
 }
 
+/** How many Pod/station pairings one request prices, direct and diverted. */
+const DIRECT_CANDIDATES = 12;
+const DETOUR_CANDIDATES = 3;
+/**
+ * How many pairings one dispatch pass prices before leaving the rest to the
+ * next one, three city seconds later.
+ *
+ * A request that finds a Pod costs two or three pairings, so an ordinary pass
+ * never reaches this; it bounds the pass where a jam has several requests that
+ * nothing can serve, and each of those has to be disproved the long way.
+ * Whoever is left keeps their place at the head of the queue, since the queue
+ * runs longest-waiting first.
+ */
+const PASS_CANDIDATES = 24;
+/** A direct plan this close to free-flow leaves a detour nothing to win. */
+const DETOUR_SLACK_SECONDS = 60;
+
 function* dispatch(world: World): Generator<void> {
   const retries = retryQueue(world);
   const waiting = world.residents
@@ -777,6 +794,7 @@ function* dispatch(world: World): Generator<void> {
   const buildingsById = new Map(
     world.buildings.map((building) => [building.id, building]),
   );
+  let passPriced = 0;
   for (const resident of waiting) {
     const journey = resident.journey!;
     if (
@@ -795,6 +813,7 @@ function* dispatch(world: World): Generator<void> {
     }
     const retryKey = `ride:${pickup.id}:${journey.destinationId}`;
     if (!retries.ready(retryKey, world.time)) continue;
+    if (passPriced >= PASS_CANDIDATES) break;
     const destination = buildingsById.get(journey.destinationId)!;
     const stationOptions = stationCandidates(world, destination).filter(
       (entry) => entry.berth.id !== pickup.id,
@@ -817,6 +836,7 @@ function* dispatch(world: World): Generator<void> {
       }),
     );
     let best: ServicePlan | null = null;
+    let slack = Infinity;
     let reason: NonNullable<Journey["waitReason"]> = "no-pod";
     // Never let six geometrically nearby but unreachable vehicles hide the
     // seventh usable one. A failed station also must not mask another's queue.
@@ -849,42 +869,58 @@ function* dispatch(world: World): Generator<void> {
         })
         .sort((left, right) => left.lowerBound - right.lowerBound);
       if (!candidates.length && idle.length) failures.add("disconnected");
-      for (const { pod, dropoff, lowerBound } of candidates) {
-        // All remaining pairs have an equal or worse optimistic door-to-door
-        // arrival. Only this proof, never a candidate quota, ends the search.
-        if (
-          best &&
-          lowerBound >=
-            best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
-        )
-          break;
-        yield;
-        const candidate = planService(
-          world,
-          pod,
-          resident,
-          pickup,
-          dropoff,
-          best
-            ? best.dropoffEnd! +
-                egressSeconds.get(best.dropoffId!)! -
-                egressSeconds.get(dropoff.id)!
-            : Infinity,
-        );
-        if (!candidate.ok) {
-          failures.add(candidate.reason);
-          continue;
+      // The direct route answers most requests on its own, so the fleet is
+      // asked that way first and the ways round are held back for the few
+      // Pods still worth asking once the direct answer is in.
+      for (const detours of [false, true]) {
+        const quota = detours ? DETOUR_CANDIDATES : DIRECT_CANDIDATES;
+        if (detours && best && slack <= DETOUR_SLACK_SECONDS) break;
+        let priced = 0;
+        for (const { pod, dropoff, lowerBound } of candidates) {
+          // All remaining pairs have an equal or worse optimistic door-to-door
+          // arrival. This proof is what usually ends the search; the quota is
+          // what ends it when nothing at all can be found.
+          if (
+            best &&
+            lowerBound >=
+              best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
+          )
+            break;
+          if (priced >= quota) break;
+          priced += 1;
+          passPriced += 1;
+          yield;
+          const candidate = planService(
+            world,
+            pod,
+            resident,
+            pickup,
+            dropoff,
+            best
+              ? best.dropoffEnd! +
+                  egressSeconds.get(best.dropoffId!)! -
+                  egressSeconds.get(dropoff.id)!
+              : Infinity,
+            detours ? "detours" : "direct",
+          );
+          if (!candidate.ok) {
+            failures.add(candidate.reason);
+            continue;
+          }
+          if (touchesPending(world, candidate.plan)) {
+            failures.add("track-busy");
+            continue;
+          }
+          const arrival =
+            candidate.plan.dropoffEnd! + egressSeconds.get(dropoff.id)!;
+          if (
+            !best ||
+            arrival < best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!
+          ) {
+            best = candidate.plan;
+            slack = arrival - lowerBound;
+          }
         }
-        if (touchesPending(world, candidate.plan)) {
-          failures.add("track-busy");
-          continue;
-        }
-        if (
-          !best ||
-          candidate.plan.dropoffEnd! + egressSeconds.get(dropoff.id)! <
-            best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!
-        )
-          best = candidate.plan;
       }
       reason =
         (
@@ -922,7 +958,7 @@ function* dispatch(world: World): Generator<void> {
     } else {
       journey.waitReason = reason;
       journey.eta = undefined;
-      retries.failed(retryKey, world.time);
+      retries.failed(retryKey, world.time, reason);
     }
     // Successful dispatch can free an origin/commit a berth; wake affected work.
     if (best) retries.refresh(world);
@@ -1125,7 +1161,9 @@ export function processPending(world: World, upgradesOnly = false) {
               break;
             }
           }
-          if (!pod.plan) retries.failed(retryKey, world.time);
+          // An evacuation blocked by a full parking row is not waiting on the
+          // fleet either; it needs a berth to come free, which the clock covers.
+          if (!pod.plan) retries.failed(retryKey, world.time, "parking-full");
           else retries.refresh(world);
         }
       }
