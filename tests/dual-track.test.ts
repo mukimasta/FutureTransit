@@ -164,8 +164,12 @@ describe("real dual-track capacity", () => {
     const west = planRelocation(dual, dual.pods[1], dual.berths[1]);
     expect(west.ok).toBe(true);
     if (!west.ok) return;
-    const eastLane = east.plan.segments.find(s => s.from.x === 2 && s.to.x === 3)!.resources[0];
-    const westLane = west.plan.segments.find(s => s.from.x === 3 && s.to.x === 2)!.resources[0];
+    const eastLane = east.plan.segments.find(
+      (s) => s.from.x === 2 && s.to.x === 3,
+    )!.resources[0];
+    const westLane = west.plan.segments.find(
+      (s) => s.from.x === 3 && s.to.x === 2,
+    )!.resources[0];
     expect(eastLane).not.toBe(westLane);
     expect(
       overlaps(
@@ -181,8 +185,11 @@ describe("real dual-track capacity", () => {
       (segment) => segment.from.x === 3 && segment.to.x === 2,
     )!;
     commitPlan(dual, west.plan);
-    expect(podPosition(dual, dual.pods[0], (eastMove.start + eastMove.end) / 2).y)
-      .not.toBe(podPosition(dual, dual.pods[1], (westMove.start + westMove.end) / 2).y);
+    expect(
+      podPosition(dual, dual.pods[0], (eastMove.start + eastMove.end) / 2).y,
+    ).not.toBe(
+      podPosition(dual, dual.pods[1], (westMove.start + westMove.end) / 2).y,
+    );
   });
 
   it("still serializes real diagonal crossings without blocking the opposite lane of one diagonal", () => {
@@ -225,7 +232,7 @@ describe("real dual-track capacity", () => {
 });
 
 describe("dual-track construction transactions", () => {
-  it("escrows a running upgrade, drains the old plan, then upgrades without invalidating it", () => {
+  it("widens immediately without invalidating the running plan", () => {
     const simulation = corridor();
     const candidate = planRelocation(
       simulation,
@@ -241,13 +248,10 @@ describe("dual-track construction transactions", () => {
     });
     expect(response.ok).toBe(true);
     expect(simulation.economy.cash).toBe(100 - TRACK_UPGRADE_COST);
-    expect(simulation.economy.spent).toBe(0);
-    expect(
-      simulation.tracks.find((entry) => entry.id === "t2")!.lanes,
-    ).not.toBe(2);
-    expect(simulation.pendingEdits).toEqual([
-      { type: "upgrade-track", id: "t2", paid: TRACK_UPGRADE_COST, targetLanes: 2 },
-    ]);
+    expect(simulation.economy.spent).toBe(TRACK_UPGRADE_COST);
+    expect(simulation.tracks.find((entry) => entry.id === "t2")!.lanes).toBe(2);
+    expect(simulation.pendingEdits).toEqual([]);
+    expect(simulation.pods[0].plan?.end).toBe(candidate.plan.end);
 
     stepWorld(simulation, candidate.plan.end + 3);
     expect(simulation.pendingEdits).toEqual([]);
@@ -258,7 +262,7 @@ describe("dual-track construction transactions", () => {
     expect(simulation.economy.spent).toBe(TRACK_UPGRADE_COST);
   });
 
-  it("refunds queued upgrade escrow and keeps batch validation atomic", () => {
+  it("does not refund an already completed upgrade when cancelling pending edits", () => {
     const simulation = corridor();
     const candidate = planRelocation(
       simulation,
@@ -270,8 +274,8 @@ describe("dual-track construction transactions", () => {
     commitPlan(simulation, candidate.plan);
     applyCommand(simulation, { type: "upgrade-tracks", ids: ["t2"] });
     expect(applyCommand(simulation, { type: "cancel-edits" }).ok).toBe(true);
-    expect(simulation.economy.cash).toBe(100);
-    expect(simulation.economy.spent).toBe(0);
+    expect(simulation.economy.cash).toBe(100 - TRACK_UPGRADE_COST);
+    expect(simulation.economy.spent).toBe(TRACK_UPGRADE_COST);
     expect(simulation.pendingEdits).toEqual([]);
 
     const before = structuredClone(simulation);
@@ -284,7 +288,7 @@ describe("dual-track construction transactions", () => {
     expect(simulation).toEqual(before);
   });
 
-  it("round-trips dual plans and pending legacy-resource upgrades in v1 saves", () => {
+  it("round-trips widened active plans and legacy movement resources", () => {
     const dual = createWorld(617);
     expect(
       applyCommand(dual, {
@@ -337,52 +341,22 @@ describe("dual-track construction transactions", () => {
     }
     expect(queued).toBe(true);
     const restoredLegacy = parseWorld(serializeWorld(legacy));
-    expect(restoredLegacy.pendingEdits[0]?.type).toBe("upgrade-track");
+    expect(restoredLegacy.pendingEdits).toEqual([]);
 
     const oldStart = berth("old-start", "parking", [0, 1], [1, 1]);
     const oldEnd = berth("old-end", "parking", [3, 2], [2, 2]);
-    oldStart.buildingId = "b-home";
-    oldEnd.buildingId = "b-home";
-    const old = world(
-      [oldStart, oldEnd],
-      [track("old-diagonal", [1, 1], [2, 2])],
-      [pod("old-pod", oldStart.id)],
-    );
-    old.buildings = [
-      {
-        id: "b-home",
-        name: "Home",
-        nameEn: "Home",
-        kind: "home",
-        x: 10,
-        y: 10,
-        w: 2,
-        h: 2,
-        bornAt: 0,
-      },
-      {
-        id: "b-office",
-        name: "Office",
-        nameEn: "Office",
-        kind: "office",
-        x: 14,
-        y: 10,
-        w: 2,
-        h: 2,
-        bornAt: 0,
-      },
-      {
-        id: "b-shop",
-        name: "Shop",
-        nameEn: "Shop",
-        kind: "shop",
-        x: 10,
-        y: 14,
-        w: 2,
-        h: 2,
-        bornAt: 0,
-      },
-    ];
+    oldStart.side = "east";
+    oldEnd.side = "west";
+    delete oldStart.buildingId;
+    delete oldEnd.buildingId;
+    // Keep a valid current city/ledger while exercising the former resource
+    // encoding; the old hand-written economy fixture is no longer a valid save.
+    const old = createWorld(620);
+    delete old.resourceModel;
+    old.berths = [oldStart, oldEnd];
+    old.tracks = [track("old-diagonal", [1, 1], [2, 2])];
+    old.pods = [pod("old-pod", oldStart.id)];
+    old.networkVersion++;
     const oldCandidate = planRelocation(old, old.pods[0], oldEnd);
     expect(oldCandidate.ok).toBe(true);
     if (!oldCandidate.ok) return;

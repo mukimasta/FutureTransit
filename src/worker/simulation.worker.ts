@@ -1,5 +1,10 @@
 /// <reference lib="webworker" />
-import { applyCommand, createWorld, stepWorld } from "../simulation";
+import {
+  applyCommand,
+  createWorld,
+  processPending,
+  stepWorld,
+} from "../simulation";
 import { TIME_SCALE } from "../shared/constants";
 import { parseWorld, serializeWorld } from "../persistence";
 import type { WorkerInput } from "../shared/types";
@@ -14,6 +19,8 @@ scope.onmessage = (event: MessageEvent<WorkerInput>) => {
     const input = event.data;
     if (input.type === "load") {
       world = parseWorld(serializeWorld(input.world));
+      // Old saved widening orders no longer need to drain, even while paused.
+      processPending(world, true);
       world.paused = true;
       previous = performance.now();
       accumulated = 0;

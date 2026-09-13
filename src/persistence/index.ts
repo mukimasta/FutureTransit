@@ -163,6 +163,10 @@ export function parseWorld(text: string): World {
   finiteTree(envelope.world);
   const w = envelope.world as unknown as World;
   check(w.version === 2, "unsupported world");
+  check(
+    w.resourceModel === undefined || w.resourceModel === 2,
+    "unsupported reservation model",
+  );
   number(w.time);
   number(w.seed);
   number(w.rng, 1, 4294967295);
@@ -340,6 +344,38 @@ export function parseWorld(text: string): World {
     const key = edgeKey(t.a, t.b);
     check(!physicalTracks.has(key), "duplicate track geometry");
     physicalTracks.add(key);
+  }
+  if (w.throughCorridors !== undefined) {
+    check(
+      w.resourceModel === 2,
+      "through lanes require the current reservation model",
+    );
+    array(w.throughCorridors, 24000);
+    const seen = new Set<string>();
+    for (const entry of w.throughCorridors) {
+      object(entry);
+      point(entry.point);
+      point(entry.from);
+      point(entry.to);
+      const key = nodeKey(entry.point);
+      check(
+        !seen.has(key) && !samePoint(entry.from, entry.to),
+        "duplicate through corridor",
+      );
+      seen.add(key);
+      for (const neighbor of [entry.from, entry.to])
+        check(
+          w.tracks.some(
+            (track) =>
+              (track.lanes ?? 1) >= 2 &&
+              ((samePoint(track.a, entry.point) &&
+                samePoint(track.b, neighbor)) ||
+                (samePoint(track.b, entry.point) &&
+                  samePoint(track.a, neighbor))),
+          ),
+          "missing through corridor edge",
+        );
+    }
   }
   const validResources = new Set<string>();
   for (const b of w.berths) {

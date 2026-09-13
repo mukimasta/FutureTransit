@@ -295,6 +295,10 @@ export type PendingEdit =
       targetLanes?: 2 | 3;
     };
 export interface World {
+  /** Version 2 preserves running reservations across additive construction. */
+  resourceModel?: 2;
+  /** Existing through lanes remain continuous when a branch joins them. */
+  throughCorridors?: { point: Point; from: Point; to: Point }[];
   version: 2;
   seed: number;
   rng: number;

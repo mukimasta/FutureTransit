@@ -293,15 +293,32 @@ function laneCorridor(world: World, point: Point): LaneCorridor | null {
   ) ?? []) {
     add(connection.point, connection.track?.lanes ?? 1);
   }
+  if (world.resourceModel === 2) {
+    const through = world.throughCorridors?.find((entry) =>
+      samePoint(entry.point, point),
+    );
+    if (through) {
+      const from = neighbors.find((entry) =>
+        samePoint(entry.point, through.from),
+      );
+      const to = neighbors.find((entry) => samePoint(entry.point, through.to));
+      if (from && to && from.lanes >= 2 && to.lanes >= 2)
+        return {
+          neighbors: [from.point, to.point].sort(comparePoints),
+          lanes: Math.min(from.lanes, to.lanes) as 2 | 3,
+        };
+    }
+  }
   if (
     neighbors.length !== 2 ||
     neighbors[0].lanes < 2 ||
-    neighbors[0].lanes !== neighbors[1].lanes
+    neighbors[1].lanes < 2 ||
+    (world.resourceModel !== 2 && neighbors[0].lanes !== neighbors[1].lanes)
   )
     return null;
   return {
     neighbors: neighbors.map((entry) => entry.point).sort(comparePoints),
-    lanes: neighbors[0].lanes as 2 | 3,
+    lanes: Math.min(neighbors[0].lanes, neighbors[1].lanes) as 2 | 3,
   };
 }
 
@@ -336,6 +353,55 @@ export function corridorNodeResources(world: World, point: Point): string[] {
   ];
 }
 
+/** Turns and lane changes conflict with every through lane at the junction. */
+export function exclusiveNodeResources(world: World, point: Point): string[] {
+  return world.resourceModel === 2
+    ? corridorNodeResources(world, point)
+    : [nodeKey(point)];
+}
+
+/** Preserve existing through geometry when new branches introduce a junction.
+ * Old trains keep their lanes; new turning movements reserve all through lanes. */
+export function preserveThroughCorridors(before: World, after: World): void {
+  const saved = new Map(
+    (before.throughCorridors ?? []).map((entry) => [
+      nodeKey(entry.point),
+      entry,
+    ]),
+  );
+  const points = new Map(
+    before.tracks
+      .flatMap((track) => [track.a, track.b])
+      .map((point) => [nodeKey(point), point]),
+  );
+  for (const [key, point] of points) {
+    const prior = laneCorridor(before, point);
+    const current = laneCorridor(after, point);
+    if (prior && !current)
+      saved.set(key, {
+        point: { ...point },
+        from: { ...prior.neighbors[0] },
+        to: { ...prior.neighbors[1] },
+      });
+  }
+  after.throughCorridors = [...saved.values()];
+}
+
+/** Demolition still drains its junction first, then discards obsolete geometry. */
+export function pruneThroughCorridors(world: World): void {
+  world.throughCorridors = world.throughCorridors?.filter((entry) => {
+    const connections =
+      resourceIndex(world).connectionsByNode.get(nodeKey(entry.point)) ?? [];
+    return [entry.from, entry.to].every((point) =>
+      connections.some(
+        (connection) =>
+          samePoint(connection.point, point) &&
+          (connection.track?.lanes ?? 1) >= 2,
+      ),
+    );
+  });
+}
+
 /** Resource used while continuously passing through a node. */
 export function movementNodeResources(
   world: World,
@@ -356,7 +422,7 @@ export function movementNodeResources(
   ) {
     return [corridorLaneKey(point, laneIndex)];
   }
-  return [nodeKey(point)];
+  return exclusiveNodeResources(world, point);
 }
 
 /** Returns the middle grid point immediately south of the building footprint. */

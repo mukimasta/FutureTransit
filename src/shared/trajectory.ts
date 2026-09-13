@@ -10,6 +10,7 @@ import { distance, samePoint } from "./math";
 import {
   canonicalMovementResources,
   edgeResources,
+  exclusiveNodeResources,
   movementNodeResources,
   movementLaneIndex,
   nodeKey,
@@ -43,6 +44,15 @@ function segmentMovementResources(
       segment.resources,
     ) ?? []
   );
+}
+
+function pointWindows(world: World, point: MotionSegment["from"]): string[] {
+  return [
+    ...new Set([
+      ...pointResources(world, point),
+      ...exclusiveNodeResources(world, point),
+    ]),
+  ];
 }
 
 function mergeWindows(
@@ -124,7 +134,7 @@ export function requiredTrajectoryWindows(
       // A continuous trajectory has no preceding dwell at its first point.
       if (index === 0) {
         add(
-          pointResources(world, segment.from),
+          pointWindows(world, segment.from),
           segment.start,
           segment.start + NODE_SECONDS + CLEARANCE_SECONDS,
         );
@@ -153,7 +163,7 @@ export function requiredTrajectoryWindows(
               next.to,
               incomingLane,
             )
-          : pointResources(world, segment.to);
+          : pointWindows(world, segment.to);
       add(
         arrivalResources,
         segment.end,
@@ -161,7 +171,7 @@ export function requiredTrajectoryWindows(
       );
     } else {
       add(
-        pointResources(world, segment.from),
+        pointWindows(world, segment.from),
         segment.start,
         segment.end + CLEARANCE_SECONDS,
       );

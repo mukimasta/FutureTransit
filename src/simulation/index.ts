@@ -26,11 +26,11 @@ import {
 import { distance, id, pathLength, pointKey, samePoint } from "../shared/math";
 import {
   buildingDoor,
-  corridorNodeResources,
   edgeKey,
   findTrackPath,
   findWalkPath,
   isBlocked,
+  pruneThroughCorridors,
   trackResources,
   validateTrackDraft,
 } from "../network";
@@ -54,6 +54,7 @@ import {
   planService,
   terminalOwner,
 } from "../scheduler";
+import { prepareExpansion } from "../scheduler/expansion";
 import {
   claimGrant,
   initialBuildings,
@@ -246,6 +247,7 @@ export function parkingPlacement(world: World, platform: Berth, side: Side) {
 export function createWorld(seed = 7): World {
   const world: World = {
     version: 2,
+    resourceModel: 2,
     seed,
     rng: seed >>> 0 || 7,
     time: 0,
@@ -647,30 +649,15 @@ function planTouchesTrackEndpoint(
   return planTouchesPoint(plan, track.a) || planTouchesPoint(plan, track.b);
 }
 
-function sameResources(left: string[], right: string[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((resource) => right.includes(resource))
-  );
-}
-
-function topologyChangeTouchesActivePlan(
-  world: World,
-  candidate: World,
-  points: Point[],
-): boolean {
-  const changed = points.filter(
-    (point, index) =>
-      points.findIndex((entry) => samePoint(entry, point)) === index &&
-      !sameResources(
-        corridorNodeResources(world, point),
-        corridorNodeResources(candidate, point),
-      ),
-  );
-  return world.pods.some(
-    (pod) =>
-      pod.plan && changed.some((point) => planTouchesPoint(pod.plan!, point)),
-  );
+function expandNetwork(world: World, candidate: World): void {
+  const expanded = prepareExpansion(world, candidate);
+  world.tracks = expanded.tracks;
+  world.berths = expanded.berths;
+  world.pods = expanded.pods;
+  world.reservations = expanded.reservations;
+  world.resourceModel = expanded.resourceModel;
+  world.throughCorridors = expanded.throughCorridors;
+  world.networkVersion = expanded.networkVersion;
 }
 
 function touchesPending(world: World, plan: ServicePlan) {
@@ -958,8 +945,14 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
         "轨道无法升级。",
         "Track can no longer be upgraded.",
       );
-    track.lanes = target;
-    track.paid += edit.paid;
+    expandNetwork(world, {
+      ...world,
+      tracks: world.tracks.map((item) =>
+        item.id === track.id
+          ? { ...item, lanes: target, paid: item.paid + edit.paid }
+          : item,
+      ),
+    });
   } else {
     const berth = world.berths.find((b) => b.id === edit.id);
     if (!berth)
@@ -1001,6 +994,7 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
   }
   world.reservations = world.reservations.filter((r) => r.end > world.time);
   world.networkVersion++;
+  pruneThroughCorridors(world);
   return result(
     true,
     "改造完成，已结算退款。",
@@ -1008,8 +1002,9 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
   );
 }
 
-function processPending(world: World) {
+export function processPending(world: World, upgradesOnly = false) {
   for (const edit of [...world.pendingEdits]) {
+    if (upgradesOnly && edit.type !== "upgrade-track") continue;
     if (edit.type === "remove-berth" || edit.type === "move-berth")
       for (const r of world.residents)
         if (
@@ -1018,7 +1013,7 @@ function processPending(world: World) {
           [r.journey?.pickupId, r.journey?.dropoffId].includes(edit.id)
         )
           fallbackWalk(world, r);
-    if (editBusy(world, edit)) {
+    if (edit.type !== "upgrade-track" && editBusy(world, edit)) {
       if (edit.type === "remove-berth" || edit.type === "move-berth") {
         const pod = world.pods.find((p) => p.berthId === edit.id && !p.plan);
         if (pod) {
@@ -1185,22 +1180,11 @@ export function applyCommand(world: World, command: Command): CommandResult {
         "预算不足；可以改短路线，或在补助可用后手动领取。",
         "Not enough budget. Shorten the route or claim a grant when ready.",
       );
-    const candidate = { ...world, tracks: [...world.tracks, ...draft.edges] };
-    if (
-      topologyChangeTouchesActivePlan(
-        world,
-        candidate,
-        draft.edges.flatMap((track) => [track.a, track.b]),
-      )
-    )
-      return result(
-        false,
-        "此处有车辆计划正在通过，请等待排空后再施工。",
-        "An active journey uses this junction. Wait for it to clear before building.",
-      );
-    world.tracks.push(...draft.edges);
+    expandNetwork(world, {
+      ...world,
+      tracks: [...world.tracks, ...draft.edges],
+    });
     book(world, "track-build", -draft.cost);
-    world.networkVersion++;
     return result(
       true,
       `已铺设 ${draft.edges.length} 段轨道。`,
@@ -1309,35 +1293,21 @@ export function applyCommand(world: World, command: Command): CommandResult {
       );
     const candidateBerth = {
       ...place,
-      id: "candidate-berth",
+      id: `berth-${world.nextId}`,
       paid: berthCost,
     };
-    const candidate = {
+    expandNetwork(world, {
       ...world,
       berths: [...world.berths, candidateBerth],
       tracks: [...world.tracks, ...(parking?.tracks ?? [])],
-    };
-    if (
-      topologyChangeTouchesActivePlan(world, candidate, [
-        place.point,
-        place.access,
-        ...(parking?.tracks.flatMap((track) => [track.a, track.b]) ?? []),
-      ])
-    )
-      return result(
-        false,
-        "此处有车辆计划正在通过，请等待排空后再建泊位。",
-        "An active journey uses this junction. Wait for it to clear before adding a berth.",
-      );
-    world.berths.push({ ...place, id: id(world, "berth-"), paid: berthCost });
-    world.tracks.push(...(parking?.tracks ?? []));
+    });
+    world.nextId++;
     if (parking?.trackCost) book(world, "track-build", -parking.trackCost);
     book(
       world,
       kind === "platform" ? "platform-build" : "parking-build",
       -berthCost,
     );
-    world.networkVersion++;
     return result(
       true,
       kind === "parking"
@@ -1412,41 +1382,26 @@ export function applyCommand(world: World, command: Command): CommandResult {
         "升级预算不足。",
         "Not enough budget for this upgrade.",
       );
-    const busy = costs.map((upgrade) => ({
-      ...upgrade,
-      busy: editBusy(world, {
-        type: "upgrade-track",
-        id: upgrade.track.id,
-        paid: upgrade.paid,
-        targetLanes: target,
-      }),
-    }));
+    const costsById = new Map(
+      costs.map((upgrade) => [upgrade.track.id, upgrade.paid]),
+    );
+    expandNetwork(world, {
+      ...world,
+      tracks: world.tracks.map((track) =>
+        costsById.has(track.id)
+          ? {
+              ...track,
+              lanes: target,
+              paid: track.paid + costsById.get(track.id)!,
+            }
+          : track,
+      ),
+    });
     book(world, "track-build", -total);
-    let completed = 0;
-    for (const upgrade of busy) {
-      if (upgrade.busy) {
-        world.pendingEdits.push({
-          type: "upgrade-track",
-          id: upgrade.track.id,
-          paid: upgrade.paid,
-          targetLanes: target,
-        });
-      } else {
-        upgrade.track.lanes = target;
-        upgrade.track.paid += upgrade.paid;
-        completed++;
-      }
-    }
-    if (completed) world.networkVersion++;
-    const queued = busy.length - completed;
     return result(
       true,
-      queued
-        ? `已升级 ${completed} 段，另有 ${queued} 段排空后升级。`
-        : `已升级 ${completed} 段为 ${target} 条共享车道。`,
-      queued
-        ? `Upgraded ${completed}; ${queued} more will upgrade after traffic clears.`
-        : `Upgraded ${completed} track sections to ${target} shared lanes.`,
+      `已升级 ${upgrades.length} 段为 ${target} 条共享车道，车辆继续原行程。`,
+      `Upgraded ${upgrades.length} track sections to ${target} shared lanes; existing trips continue.`,
     );
   }
   if (command.type === "remove-tracks") {
@@ -1520,6 +1475,7 @@ export function applyCommand(world: World, command: Command): CommandResult {
       );
       book(world, "refund", refund);
       world.networkVersion++;
+      pruneThroughCorridors(world);
     }
     for (const entry of queued)
       world.pendingEdits.push({ type: "remove-track", id: entry.track.id });
