@@ -6,6 +6,7 @@ import type {
   World,
 } from "../shared/types";
 import { loadLocal, saveLocal } from "../persistence";
+import { applyWorldDelta } from "../shared/world-delta";
 
 export function useSimulation() {
   const [world, setWorld] = useState<World | null>(null);
@@ -18,11 +19,27 @@ export function useSimulation() {
       { type: "module" },
     );
     worker.current = runtime;
+    let sequence = 0;
     runtime.onmessage = (event: MessageEvent<WorkerOutput>) => {
       const message = event.data;
       if (message.type === "world") {
+        sequence = 1;
         worldRef.current = message.world;
         setWorld(message.world);
+      }
+      if (message.type === "delta") {
+        if (!worldRef.current || message.delta.sequence !== sequence + 1) {
+          runtime.postMessage({ type: "snapshot" });
+          return;
+        }
+        try {
+          const next = applyWorldDelta(worldRef.current, message.delta);
+          sequence = message.delta.sequence;
+          worldRef.current = next;
+          setWorld(next);
+        } catch {
+          runtime.postMessage({ type: "snapshot" });
+        }
       }
       if (message.type === "result") setLastResult(message.result);
       if (message.type === "error")

@@ -59,9 +59,54 @@ interface TimedBlock {
 
 const berthResource = (berthId: string) => `${BERTH_RESOURCE_PREFIX}${berthId}`;
 
+interface GeometryCache {
+  version: number;
+  berths: Berth[];
+  paths: Map<string, Point[][]>;
+  templates: Map<string, ReturnType<typeof computeServiceTemplate>>;
+}
+const geometryCaches = new WeakMap<World, GeometryCache>();
+const pathIds = new WeakMap<Point[], number>();
+let nextPathId = 0;
+const compiledWindows = new WeakMap<MotionSegment[], RelativeReservation[]>();
+const compiledOpenings = new WeakMap<MotionSegment[], RelativeReservation[]>();
+function geometryCache(world: World): GeometryCache {
+  let cache = geometryCaches.get(world);
+  if (
+    !cache ||
+    cache.version !== world.networkVersion ||
+    cache.berths !== world.berths
+  ) {
+    cache = {
+      version: world.networkVersion,
+      berths: world.berths,
+      paths: new Map(),
+      templates: new Map(),
+    };
+    geometryCaches.set(world, cache);
+  }
+  return cache;
+}
+function pathId(path: Point[]): number {
+  let id = pathIds.get(path);
+  if (id === undefined) {
+    id = ++nextPathId;
+    pathIds.set(path, id);
+  }
+  return id;
+}
+
 function route(world: World, from: Berth, to: Berth) {
   if (samePoint(from.point, to.point)) return [from.point];
-  return findTrackPath(world, from.point, to.point);
+  const cache = geometryCache(world);
+  const key = `single:${from.id}:${to.id}`;
+  const cached = cache.paths.get(key);
+  if (cached) return cached[0] ?? null;
+  const path = findTrackPath(world, from.point, to.point);
+  if (cache.paths.size >= 4096)
+    cache.paths.delete(cache.paths.keys().next().value!);
+  cache.paths.set(key, path ? [path] : []);
+  return path;
 }
 
 /**
@@ -72,7 +117,15 @@ function route(world: World, from: Berth, to: Berth) {
  * other ways here is what lets the search choose between the two.
  */
 function routeOptions(world: World, from: Berth, to: Berth): Point[][] {
-  return findTrackPathOptions(world, from.point, to.point);
+  const cache = geometryCache(world);
+  const key = `options:${from.id}:${to.id}`;
+  const cached = cache.paths.get(key);
+  if (cached) return cached;
+  const paths = findTrackPathOptions(world, from.point, to.point);
+  if (cache.paths.size >= 4096)
+    cache.paths.delete(cache.paths.keys().next().value!);
+  cache.paths.set(key, paths);
+  return paths;
 }
 
 const travelSeconds = (path: Point[]) =>
@@ -321,13 +374,17 @@ function relativeReservations(
   prefix: RelativeReservation[],
   prefixLength: number,
 ): RelativeReservation[] {
+  const cached = compiledWindows.get(segments);
+  if (cached) return cached;
   if (prefixLength >= segments.length) return prefix;
-  return mergeSortedTrajectoryWindows(
+  const windows = mergeSortedTrajectoryWindows(
     prefix,
     mergeTrajectoryWindows(
       trajectoryWindowRange(world, segments, prefixLength, segments.length, 1),
     ),
   );
+  compiledWindows.set(segments, windows);
+  return windows;
 }
 
 function mergeReservations(
@@ -788,7 +845,9 @@ function scanDeparture(scan: WindowScan, departure: number): number {
 
 /** What is known about when a shared opening can be left. */
 type OpeningBound =
-  { kind: "clears"; at: number } | { kind: "never" } | { kind: "unknown" };
+  | { kind: "clears"; at: number }
+  | { kind: "never" }
+  | { kind: "unknown" };
 
 /**
  * The soonest a shared opening could be left, whatever a candidate does after.
@@ -971,6 +1030,55 @@ function idlePodFailure(pod: Pod): (PlanResult & { ok: false }) | null {
 }
 
 function serviceTemplate(
+  world: World,
+  emptyPath: Point[],
+  loadedPath: Point[],
+  relocationPath: Point[],
+  pickup: Berth,
+  dropoff: Berth,
+  finalBerth: Berth,
+  laneProfile: number,
+): ReturnType<typeof computeServiceTemplate> {
+  const cache = geometryCache(world);
+  const key = `${pathId(emptyPath)}:${pathId(loadedPath)}:${pathId(relocationPath)}:${pickup.id}:${dropoff.id}:${finalBerth.id}:${laneProfile}`;
+  const cached = cache.templates.get(key);
+  if (cached) return cached;
+  const template = computeServiceTemplate(
+    world,
+    emptyPath,
+    loadedPath,
+    relocationPath,
+    pickup,
+    dropoff,
+    finalBerth,
+    laneProfile,
+  );
+  if (cache.templates.size >= 1024)
+    cache.templates.delete(cache.templates.keys().next().value!);
+  cache.templates.set(key, template);
+  return template;
+}
+
+function openingReservations(
+  world: World,
+  template: ReturnType<typeof serviceTemplate>,
+): RelativeReservation[] {
+  const cached = compiledOpenings.get(template.segments);
+  if (cached) return cached;
+  const opening = mergeTrajectoryWindows(
+    trajectoryWindowRange(
+      world,
+      template.segments.slice(0, template.prefixLength),
+      0,
+      template.prefixLength,
+      1,
+    ),
+  );
+  compiledOpenings.set(template.segments, opening);
+  return opening;
+}
+
+function computeServiceTemplate(
   world: World,
   emptyPath: NonNullable<ReturnType<typeof findTrackPath>>,
   loadedPath: NonNullable<ReturnType<typeof findTrackPath>>,
@@ -1224,15 +1332,7 @@ function computeService(
         // asked for it, and a floor is only a floor once they all have one.
         let opening = openings[laneProfile];
         if (!opening) {
-          opening = mergeTrajectoryWindows(
-            trajectoryWindowRange(
-              world,
-              template.segments.slice(0, template.prefixLength),
-              0,
-              template.prefixLength,
-              1,
-            ),
-          );
+          opening = openingReservations(world, template);
           openings[laneProfile] = opening;
           // A floor earns its scan by cutting a list of terminals short. Where
           // a rerouted run is only being measured against the berth that

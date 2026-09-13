@@ -379,5 +379,6 @@ export type WorkerInput =
   | { type: "snapshot" };
 export type WorkerOutput =
   | { type: "world"; world: World }
+  | { type: "delta"; delta: import("./world-delta").WorldDelta }
   | { type: "result"; result: CommandResult }
   | { type: "error"; message: string };

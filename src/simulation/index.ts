@@ -11,6 +11,7 @@ import type {
   Side,
   World,
 } from "../shared/types";
+import { retryQueue } from "./retry";
 import { recordTrackTraffic, forgetTrackTraffic } from "../insights/traffic";
 import {
   ALIGHT_SECONDS,
@@ -708,7 +709,7 @@ function expandNetwork(world: World, candidate: World): void {
   world.networkVersion = expanded.networkVersion;
 }
 
-function touchesPending(world: World, plan: ServicePlan) {
+function touchesPending(world: World, plan: ServicePlan, evacuating?: string) {
   return world.pendingEdits.some((edit) => {
     if (edit.type === "remove-track" || edit.type === "upgrade-track") {
       const track = world.tracks.find((t) => t.id === edit.id);
@@ -722,7 +723,7 @@ function touchesPending(world: World, plan: ServicePlan) {
       );
     }
     return [
-      plan.originBerthId,
+      plan.originBerthId === evacuating ? undefined : plan.originBerthId,
       plan.finalBerthId,
       plan.pickupId,
       plan.dropoffId,
@@ -761,7 +762,8 @@ function relocateBlocked(world: World, berthId: string) {
   return false;
 }
 
-function dispatch(world: World) {
+function* dispatch(world: World): Generator<void> {
+  const retries = retryQueue(world);
   const waiting = world.residents
     .filter((r) => r.status === "waiting" && r.journey && !r.journey.podId)
     .sort(
@@ -790,6 +792,8 @@ function dispatch(world: World) {
       fallbackWalk(world, resident);
       continue;
     }
+    const retryKey = `ride:${pickup.id}:${journey.destinationId}`;
+    if (!retries.ready(retryKey, world.time)) continue;
     const destination = buildingsById.get(journey.destinationId)!;
     const stationOptions = stationCandidates(world, destination).filter(
       (entry) => entry.berth.id !== pickup.id,
@@ -842,6 +846,7 @@ function dispatch(world: World) {
               best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
           )
             continue;
+          yield;
           const candidate = planService(world, pod, resident, pickup, dropoff);
           if (!candidate.ok) {
             failures.add(candidate.reason);
@@ -895,7 +900,10 @@ function dispatch(world: World) {
     } else {
       journey.waitReason = reason;
       journey.eta = undefined;
+      retries.failed(retryKey, world.time);
     }
+    // Successful dispatch can free an origin/commit a berth; wake affected work.
+    if (best) retries.refresh(world);
   }
   // Older saves may contain idle platform residents. Let them leave physically,
   // without teleporting or deleting vehicles, even when nobody is calling here.
@@ -1065,6 +1073,7 @@ function executeEdit(world: World, edit: PendingEdit): CommandResult {
 }
 
 export function processPending(world: World, upgradesOnly = false) {
+  const retries = retryQueue(world);
   for (const edit of [...world.pendingEdits]) {
     if (upgradesOnly && edit.type !== "upgrade-track") continue;
     if (edit.type === "remove-berth" || edit.type === "move-berth")
@@ -1079,15 +1088,23 @@ export function processPending(world: World, upgradesOnly = false) {
       if (edit.type === "remove-berth" || edit.type === "move-berth") {
         const pod = world.pods.find((p) => p.berthId === edit.id && !p.plan);
         if (pod) {
+          const retryKey = `evacuate:${pod.id}:${edit.id}`;
+          if (!retries.ready(retryKey, world.time)) continue;
+          const unavailable = new Set(world.pendingEdits.map((e) => e.id));
           for (const target of world.berths.filter(
-            (b) => b.id !== edit.id && !terminalOwner(world, b.id),
+            (b) =>
+              b.kind === "parking" &&
+              !unavailable.has(b.id) &&
+              !terminalOwner(world, b.id),
           )) {
             const plan = planRelocation(world, pod, target);
-            if (plan.ok && !touchesPending(world, plan.plan)) {
+            if (plan.ok && !touchesPending(world, plan.plan, edit.id)) {
               commitPlan(world, plan.plan);
               break;
             }
           }
+          if (!pod.plan) retries.failed(retryKey, world.time);
+          else retries.refresh(world);
         }
       }
       continue;
@@ -1105,7 +1122,7 @@ export function processPending(world: World, upgradesOnly = false) {
   }
 }
 
-export function stepWorld(world: World, seconds: number): void {
+function* worldSteps(world: World, seconds: number): Generator<void> {
   if (world.paused || !Number.isFinite(seconds) || seconds <= 0) return;
   const end = world.time + seconds;
   while (world.time < end) {
@@ -1129,7 +1146,7 @@ export function stepWorld(world: World, seconds: number): void {
         } else finishJourney(world, resident);
       }
     }
-    if (Math.floor(world.time) % 3 === 0) dispatch(world);
+    if (Math.floor(world.time) % 3 === 0) yield* dispatch(world);
     processPending(world);
     updateEconomy(world, dt);
     updateGrowth(world);
@@ -1137,6 +1154,29 @@ export function stepWorld(world: World, seconds: number): void {
       world.reservations = world.reservations.filter(
         (r) => r.end > world.time - 30,
       );
+    yield;
+  }
+}
+
+export function stepWorld(world: World, seconds: number): void {
+  for (const _ of worldSteps(world, seconds)) {
+    /* Deterministic synchronous runner. */
+  }
+}
+
+/** Same ordering and outcome as stepWorld; yielding never advances city time.
+ * Callers must queue commands until this transaction finishes. */
+export async function stepWorldAsync(
+  world: World,
+  seconds: number,
+  yieldToHost: () => Promise<void>,
+): Promise<void> {
+  let sliceStarted = performance.now();
+  for (const _ of worldSteps(world, seconds)) {
+    if (performance.now() - sliceStarted >= 8) {
+      await yieldToHost();
+      sliceStarted = performance.now();
+    }
   }
 }
 

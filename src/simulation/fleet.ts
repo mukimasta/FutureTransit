@@ -11,6 +11,7 @@ interface ReachableCache {
   berths: Berth[];
   pods: Pod[];
   networkVersion: number;
+  pendingStamp: string;
   idle: (string | null)[];
   byPickup: Map<string, Pod[]>;
 }
@@ -25,18 +26,26 @@ function idleStampMatches(cache: ReachableCache, pods: Pod[]): boolean {
 }
 
 export function reachableIdlePods(world: World, pickup: Berth): Pod[] {
+  const unavailable = new Set(
+    world.pendingEdits
+      .filter((e) => e.type === "remove-berth" || e.type === "move-berth")
+      .map((e) => e.id),
+  );
+  const pendingStamp = [...unavailable].join(",");
   let cache = reachableCaches.get(world);
   if (
     !cache ||
     cache.berths !== world.berths ||
     cache.pods !== world.pods ||
     cache.networkVersion !== world.networkVersion ||
+    cache.pendingStamp !== pendingStamp ||
     !idleStampMatches(cache, world.pods)
   ) {
     cache = {
       berths: world.berths,
       pods: world.pods,
       networkVersion: world.networkVersion,
+      pendingStamp,
       idle: world.pods.map((pod) => (pod.plan ? null : pod.berthId)),
       byPickup: new Map(),
     };
@@ -46,7 +55,7 @@ export function reachableIdlePods(world: World, pickup: Berth): Pod[] {
   if (hit) return hit;
   const berthsById = new Map(world.berths.map((berth) => [berth.id, berth]));
   const reachable = world.pods
-    .filter((p) => !p.plan && p.berthId)
+    .filter((p) => !p.plan && p.berthId && !unavailable.has(p.berthId))
     .flatMap((pod) => {
       const origin = berthsById.get(pod.berthId!);
       const length = origin
