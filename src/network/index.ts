@@ -22,6 +22,18 @@ interface PathCache {
 }
 const pathCaches = new WeakMap<World, PathCache>();
 
+/**
+ * Walking reads the building footprints and nothing else, so pedestrian routes
+ * survive every track and berth edit. They are kept against the obstacle mask
+ * itself, which is already rebuilt exactly when a building appears, moves or
+ * goes away.
+ */
+interface WalkPathCache {
+  occupied: Uint8Array;
+  paths: Map<number | string, Point[] | null>;
+}
+const walkPathCaches = new WeakMap<World, WalkPathCache>();
+
 interface ResourceConnection {
   point: Point;
   track?: Track;
@@ -40,6 +52,7 @@ interface ResourceIndex {
   nodeResources: Map<string, string[]>;
   dwellResources: Map<string, string[]>;
   trackGraph: Map<string, GraphEdge[]> | null;
+  trackTrees: Map<string, TrackTree>;
 }
 const resourceIndexes = new WeakMap<World, ResourceIndex>();
 
@@ -86,6 +99,7 @@ function resourceIndex(world: World): ResourceIndex {
     nodeResources: new Map(),
     dwellResources: new Map(),
     trackGraph: null,
+    trackTrees: new Map(),
   };
   resourceIndexes.set(world, index);
   return index;
@@ -179,6 +193,20 @@ function storedPath(
   to: Point,
   walking: boolean,
 ): Point[] | null {
+  if (walking) {
+    const occupied = walkOccupancy(world);
+    let walkCache = walkPathCaches.get(world);
+    if (walkCache === undefined || walkCache.occupied !== occupied) {
+      walkCache = { occupied, paths: new Map() };
+      walkPathCaches.set(world, walkCache);
+    }
+    const key = pathCacheKey(world, from, to, walking);
+    const cached = walkCache.paths.get(key);
+    if (cached !== undefined) return cached;
+    const path = computeWalkPath(world, from, to);
+    walkCache.paths.set(key, path);
+    return path;
+  }
   // All production topology edits increment networkVersion. Counts additionally
   // protect construction fixtures; direct coordinate edits must bump the version.
   let cache = pathCaches.get(world);
@@ -205,9 +233,7 @@ function storedPath(
   const key = pathCacheKey(world, from, to, walking);
   const cached = cache.paths.get(key);
   if (cached !== undefined) return cached;
-  const path = walking
-    ? computeWalkPath(world, from, to)
-    : computeTrackPath(world, from, to);
+  const path = computeTrackPath(world, from, to);
   cache.paths.set(key, path);
   return path;
 }
@@ -910,22 +936,28 @@ interface TrackEntry {
   cost: number;
 }
 
-/** Finds a shortest route over built track plus every automatic berth spur. */
-function computeTrackPath(
-  world: World,
-  from: Point,
-  to: Point,
-): Point[] | null {
-  if (!isGridPoint(from) || !isGridPoint(to)) return null;
-  if (samePoint(from, to)) return [{ ...from }];
+/**
+ * Every shortest route out of one origin, as the parent links a search leaves
+ * behind.
+ *
+ * A berth is never travelled through, only entered as the final step, so the
+ * search behind these links is the same one a single destination would have
+ * run: the destination is a leaf, and nothing beyond it could have changed the
+ * way there. One origin therefore answers for every destination — the shape of
+ * the question a dispatch pass actually asks.
+ */
+interface TrackTree {
+  parents: Map<string, string>;
+  points: Map<string, Point>;
+}
+
+function trackTree(world: World, from: Point, startKey: string): TrackTree {
+  const index = resourceIndex(world);
+  const cached = index.trackTrees.get(startKey);
+  if (cached) return cached;
 
   const graph = trackGraph(world);
-
-  const startKey = nodeKey(from);
-  const endKey = nodeKey(to);
-  if (!graph.has(startKey) || !graph.has(endKey)) return null;
-
-  const terminalKeys = resourceIndex(world).berthsByPoint;
+  const terminalKeys = index.berthsByPoint;
   const distances = new Map<string, number>([[startKey, 0]]);
   const parents = new Map<string, string>();
   const pointsByKey = new Map<string, Point>([[startKey, { ...from }]]);
@@ -944,15 +976,12 @@ function computeTrackPath(
     const current = entry.key;
     if (settled.has(current)) continue;
     settled.add(current);
-    if (current === endKey)
-      return reconstructPath(parents, pointsByKey, endKey);
     if (terminalKeys.has(current) && current !== startKey) continue;
 
     const currentCost = distances.get(current)!;
     // Neighbour order cannot matter: every neighbour updates a distinct key.
     for (const neighbor of graph.get(current) ?? []) {
       const key = nodeKey(neighbor.point);
-      if (terminalKeys.has(key) && key !== endKey) continue;
       const candidate = currentCost + neighbor.cost;
       if (
         candidate <
@@ -965,7 +994,29 @@ function computeTrackPath(
       }
     }
   }
-  return null;
+  const tree: TrackTree = { parents, points: pointsByKey };
+  index.trackTrees.set(startKey, tree);
+  return tree;
+}
+
+/** Finds a shortest route over built track plus every automatic berth spur. */
+function computeTrackPath(
+  world: World,
+  from: Point,
+  to: Point,
+): Point[] | null {
+  if (!isGridPoint(from) || !isGridPoint(to)) return null;
+  if (samePoint(from, to)) return [{ ...from }];
+
+  const graph = trackGraph(world);
+
+  const startKey = nodeKey(from);
+  const endKey = nodeKey(to);
+  if (!graph.has(startKey) || !graph.has(endKey)) return null;
+
+  const tree = trackTree(world, from, startKey);
+  if (!tree.points.has(endKey)) return null;
+  return reconstructPath(tree.parents, tree.points, endKey);
 }
 
 const WALK_DIRECTIONS: Point[] = [

@@ -2,9 +2,50 @@ import { pointKey } from "../shared/math";
 import { trackPathLength } from "../network";
 import type { Berth, Pod, World } from "../shared/types";
 
+/**
+ * Which Pods are reachable depends on where the idle ones are parked and on the
+ * network, not on who is waiting, so a dispatch pass asking berth after berth
+ * reuses one answer per platform until a Pod takes or finishes a plan.
+ */
+interface ReachableCache {
+  berths: Berth[];
+  pods: Pod[];
+  networkVersion: number;
+  idle: (string | null)[];
+  byPickup: Map<string, Pod[]>;
+}
+const reachableCaches = new WeakMap<World, ReachableCache>();
+
+function idleStampMatches(cache: ReachableCache, pods: Pod[]): boolean {
+  if (cache.idle.length !== pods.length) return false;
+  for (let index = 0; index < pods.length; index += 1)
+    if (cache.idle[index] !== (pods[index].plan ? null : pods[index].berthId))
+      return false;
+  return true;
+}
+
 export function reachableIdlePods(world: World, pickup: Berth): Pod[] {
+  let cache = reachableCaches.get(world);
+  if (
+    !cache ||
+    cache.berths !== world.berths ||
+    cache.pods !== world.pods ||
+    cache.networkVersion !== world.networkVersion ||
+    !idleStampMatches(cache, world.pods)
+  ) {
+    cache = {
+      berths: world.berths,
+      pods: world.pods,
+      networkVersion: world.networkVersion,
+      idle: world.pods.map((pod) => (pod.plan ? null : pod.berthId)),
+      byPickup: new Map(),
+    };
+    reachableCaches.set(world, cache);
+  }
+  const hit = cache.byPickup.get(pickup.id);
+  if (hit) return hit;
   const berthsById = new Map(world.berths.map((berth) => [berth.id, berth]));
-  return world.pods
+  const reachable = world.pods
     .filter((p) => !p.plan && p.berthId)
     .flatMap((pod) => {
       const origin = berthsById.get(pod.berthId!);
@@ -15,6 +56,8 @@ export function reachableIdlePods(world: World, pickup: Berth): Pod[] {
     })
     .sort((a, b) => a.length - b.length || a.pod.id.localeCompare(b.pod.id))
     .map((entry) => entry.pod);
+  cache.byPickup.set(pickup.id, reachable);
+  return reachable;
 }
 
 export interface ParkingGroup {

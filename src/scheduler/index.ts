@@ -77,9 +77,13 @@ function terminalOwners(world: World, berthId: string): string[] {
 
 /**
  * Every berth's durable tail commitments in one pass. Callers that ask about a
- * whole berth list would otherwise rescan the fleet per berth.
+ * whole berth list would otherwise rescan the fleet per berth — and a dispatch
+ * pass asks berth after berth, so the index is kept until a Pod's berth or plan
+ * moves it somewhere else.
  */
 export function terminalOwnerIndex(world: World): Map<string, string[]> {
+  const cache = planningCache(world);
+  if (cache.owners) return cache.owners;
   const owners = new Map<string, string[]>();
   for (const pod of world.pods) {
     const terminalId = pod.plan ? pod.plan.finalBerthId : pod.berthId;
@@ -88,6 +92,7 @@ export function terminalOwnerIndex(world: World): Map<string, string[]> {
     if (existing) existing.push(pod.id);
     else owners.set(terminalId, [pod.id]);
   }
+  cache.owners = owners;
   return owners;
 }
 
@@ -334,19 +339,59 @@ function latestEndBefore(calendar: ResourceCalendar, limit: number): number {
 }
 
 /**
- * One dispatch pass asks the same Pod to plan against the same calendar dozens
- * of times, so the result is kept until something it reads actually changes:
- * the reservation list, the clock, or any Pod's berth or plan boundaries.
+ * A dispatch pass asks the same questions over and over: the same Pod against
+ * the same calendar, and the same Pod-pickup-dropoff service for every waiting
+ * passenger who happens to share that pair of platforms. None of those answers
+ * depend on who is waiting, so they are kept until something they actually read
+ * changes: the reservation list, the clock, the network, a pending edit, or any
+ * Pod's berth or plan boundaries.
  */
 interface CalendarCache {
   reservations: Reservation[];
   pods: Pod[];
+  berths: Berth[];
+  networkVersion: number;
+  pendingEdits: World["pendingEdits"];
+  pendingIds: string[];
   time: number;
   stamp: (string | number | null | undefined)[];
   byPod: Map<string, Map<string, ResourceCalendar>>;
+  byService: Map<string, ServiceOutcome>;
+  owners?: Map<string, string[]>;
 }
+
+/**
+ * A finished service computation with the passenger left out: everything
+ * `planService` derives before it stamps a Resident onto the plan.
+ */
+type ServiceOutcome =
+  | { ok: false; reason: (PlanResult & { ok: false })["reason"] }
+  | {
+      ok: true;
+      originBerthId: string;
+      finalBerthId: string;
+      pickupId: string;
+      dropoffId: string;
+      departure: number;
+      pickupStart: number;
+      pickupEnd: number;
+      dropoffStart: number;
+      dropoffEnd: number;
+      end: number;
+      segments: MotionSegment[];
+      reservations: Reservation[];
+    };
+
 const calendarCaches = new WeakMap<World, CalendarCache>();
 const PLAN_STAMP_FIELDS = 4;
+
+function pendingMatches(cache: CalendarCache, world: World): boolean {
+  if (cache.pendingEdits === world.pendingEdits) return true;
+  if (cache.pendingIds.length !== world.pendingEdits.length) return false;
+  for (let index = 0; index < world.pendingEdits.length; index += 1)
+    if (cache.pendingIds[index] !== world.pendingEdits[index].id) return false;
+  return true;
+}
 
 function planStampMatches(cache: CalendarCache, pods: Pod[]): boolean {
   if (cache.stamp.length !== pods.length * PLAN_STAMP_FIELDS) return false;
@@ -379,27 +424,40 @@ function planStamp(pods: Pod[]): (string | number | null | undefined)[] {
   return stamp;
 }
 
+function planningCache(world: World): CalendarCache {
+  const cache = calendarCaches.get(world);
+  if (
+    cache &&
+    cache.reservations === world.reservations &&
+    cache.pods === world.pods &&
+    cache.berths === world.berths &&
+    cache.networkVersion === world.networkVersion &&
+    cache.time === world.time &&
+    pendingMatches(cache, world) &&
+    planStampMatches(cache, world.pods)
+  )
+    return cache;
+  const fresh: CalendarCache = {
+    reservations: world.reservations,
+    pods: world.pods,
+    berths: world.berths,
+    networkVersion: world.networkVersion,
+    pendingEdits: world.pendingEdits,
+    pendingIds: world.pendingEdits.map((edit) => edit.id),
+    time: world.time,
+    stamp: planStamp(world.pods),
+    byPod: new Map(),
+    byService: new Map(),
+  };
+  calendarCaches.set(world, fresh);
+  return fresh;
+}
+
 function blockedResources(
   world: World,
   podId: string,
 ): Map<string, ResourceCalendar> {
-  let cache = calendarCaches.get(world);
-  if (
-    !cache ||
-    cache.reservations !== world.reservations ||
-    cache.pods !== world.pods ||
-    cache.time !== world.time ||
-    !planStampMatches(cache, world.pods)
-  ) {
-    cache = {
-      reservations: world.reservations,
-      pods: world.pods,
-      time: world.time,
-      stamp: planStamp(world.pods),
-      byPod: new Map(),
-    };
-    calendarCaches.set(world, cache);
-  }
+  const cache = planningCache(world);
   const cached = cache.byPod.get(podId);
   if (cached) return cached;
   const calendars = computeBlockedResources(world, podId);
@@ -629,7 +687,7 @@ function serviceTerminalCandidates(
   return candidates;
 }
 
-function idlePodFailure(pod: Pod): PlanResult | null {
+function idlePodFailure(pod: Pod): (PlanResult & { ok: false }) | null {
   if (pod.plan !== null || pod.berthId === null)
     return { ok: false, reason: "no-pod" };
   return null;
@@ -701,7 +759,14 @@ function serviceTemplate(
   return { segments, pickupStart, pickupEnd, dropoffStart, dropoffEnd };
 }
 
-/** Build a complete empty-to-pickup, loaded, and terminal-parking candidate. */
+/**
+ * Build a complete empty-to-pickup, loaded, and terminal-parking candidate.
+ *
+ * Only the plan's identity fields depend on the passenger, so the search itself
+ * is shared by everyone waiting for the same Pod between the same platforms —
+ * the common case in a rush-hour queue. Segments and reservations are copied
+ * out of the shared result so no two callers ever hold the same arrays.
+ */
 export function planService(
   world: World,
   pod: Pod,
@@ -709,6 +774,47 @@ export function planService(
   pickup: Berth,
   dropoff: Berth,
 ): PlanResult {
+  const cache = planningCache(world);
+  const key = `${pod.id}\u0000${pickup.id}\u0000${dropoff.id}`;
+  let outcome = cache.byService.get(key);
+  if (!outcome) {
+    outcome = computeService(world, pod, pickup, dropoff);
+    cache.byService.set(key, outcome);
+  }
+  if (!outcome.ok) return { ok: false, reason: outcome.reason };
+  const requestedAt = resident.journey?.startedAt ?? world.time;
+  return {
+    ok: true,
+    plan: {
+      id: `service:${pod.id}:${resident.id}:${requestedAt}`,
+      podId: pod.id,
+      residentId: resident.id,
+      originBerthId: outcome.originBerthId,
+      finalBerthId: outcome.finalBerthId,
+      pickupId: outcome.pickupId,
+      dropoffId: outcome.dropoffId,
+      requestedAt,
+      departure: outcome.departure,
+      pickupStart: outcome.pickupStart,
+      pickupEnd: outcome.pickupEnd,
+      dropoffStart: outcome.dropoffStart,
+      dropoffEnd: outcome.dropoffEnd,
+      end: outcome.end,
+      safetyBuffer: 1,
+      segments: outcome.segments.map((segment) => ({ ...segment })),
+      reservations: outcome.reservations.map((reservation) => ({
+        ...reservation,
+      })),
+    },
+  };
+}
+
+function computeService(
+  world: World,
+  pod: Pod,
+  pickup: Berth,
+  dropoff: Berth,
+): ServiceOutcome {
   const podFailure = idlePodFailure(pod);
   if (podFailure) return podFailure;
   const actualPickup = world.berths.find((berth) => berth.id === pickup.id);
@@ -811,29 +917,21 @@ export function planService(
     }
   }
   if (!best) return { ok: false, reason: "track-busy" };
-  const requestedAt = resident.journey?.startedAt ?? world.time;
   const { departure } = best.scheduled;
   return {
     ok: true,
-    plan: {
-      id: `service:${pod.id}:${resident.id}:${requestedAt}`,
-      podId: pod.id,
-      residentId: resident.id,
-      originBerthId: origin.id,
-      finalBerthId: best.terminal.berth.id,
-      pickupId: actualPickup.id,
-      dropoffId: actualDropoff.id,
-      requestedAt,
-      departure,
-      pickupStart: best.template.pickupStart + departure,
-      pickupEnd: best.template.pickupEnd + departure,
-      dropoffStart: best.template.dropoffStart + departure,
-      dropoffEnd: best.template.dropoffEnd + departure,
-      end: best.scheduled.segments.at(-1)!.end,
-      safetyBuffer: 1,
-      segments: best.scheduled.segments,
-      reservations: best.scheduled.reservations,
-    },
+    originBerthId: origin.id,
+    finalBerthId: best.terminal.berth.id,
+    pickupId: actualPickup.id,
+    dropoffId: actualDropoff.id,
+    departure,
+    pickupStart: best.template.pickupStart + departure,
+    pickupEnd: best.template.pickupEnd + departure,
+    dropoffStart: best.template.dropoffStart + departure,
+    dropoffEnd: best.template.dropoffEnd + departure,
+    end: best.scheduled.segments.at(-1)!.end,
+    segments: best.scheduled.segments,
+    reservations: best.scheduled.reservations,
   };
 }
 
@@ -985,12 +1083,21 @@ export function commitPlan(world: World, plan: ServicePlan): void {
     throw new Error(`Cannot commit plan ${plan.id}: invalid reservation`);
   }
   const blocks = existingBlocks(world, plan.podId);
+  // Only blocks on the same resource can conflict, and grouping keeps them in
+  // the order a scan of the whole list would have met them, so the first
+  // conflict reported is still the first conflict there is.
+  const blocksByResource = new Map<string, TimedBlock[]>();
+  for (const block of blocks) {
+    const group = blocksByResource.get(block.resource);
+    if (group) group.push(block);
+    else blocksByResource.set(block.resource, [block]);
+  }
   for (const reservation of reservations) {
-    const conflict = blocks.find(
-      (block) =>
-        block.resource === reservation.resource &&
+    const conflict = blocksByResource
+      .get(reservation.resource)
+      ?.find((block) =>
         overlaps(reservation.start, reservation.end, block.start, block.end),
-    );
+      );
     if (conflict) {
       throw new Error(
         `Cannot commit plan ${plan.id}: resource ${reservation.resource} conflicts with ${conflict.ownerId}`,
@@ -998,10 +1105,9 @@ export function commitPlan(world: World, plan: ServicePlan): void {
     }
   }
   const finalResource = berthResource(plan.finalBerthId);
-  const futureFinalConflict = blocks.find(
-    (block) =>
-      block.resource === finalResource && block.end > plan.end + EPSILON,
-  );
+  const futureFinalConflict = blocksByResource
+    .get(finalResource)
+    ?.find((block) => block.end > plan.end + EPSILON);
   if (futureFinalConflict) {
     throw new Error(
       `Cannot commit plan ${plan.id}: final berth ${plan.finalBerthId} has a later visit by ${futureFinalConflict.ownerId}`,
