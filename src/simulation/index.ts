@@ -55,6 +55,7 @@ import {
   commitPlan,
   planRelocation,
   planService,
+  planningNetwork,
   terminalOwner,
   terminalOwnerIndex,
 } from "../scheduler";
@@ -802,9 +803,10 @@ function* dispatch(world: World): Generator<void> {
     const egressSeconds = new Map(
       stationOptions.map((entry) => [entry.berth.id, entry.seconds]),
     );
+    const navigation = planningNetwork(world);
     const loadedSeconds = new Map(
       dropoffs.map((dropoff) => {
-        const length = trackPathLength(world, pickup.point, dropoff.point);
+        const length = trackPathLength(navigation, pickup.point, dropoff.point);
         return [
           dropoff.id,
           length !== null
@@ -814,7 +816,6 @@ function* dispatch(world: World): Generator<void> {
         ] as const;
       }),
     );
-    const minimumLoaded = Math.min(...loadedSeconds.values());
     let best: ServicePlan | null = null;
     let reason: NonNullable<Journey["waitReason"]> = "no-pod";
     // Never let six geometrically nearby but unreachable vehicles hide the
@@ -822,47 +823,68 @@ function* dispatch(world: World): Generator<void> {
     for (let attempt = 0; attempt < 2 && !best; attempt++) {
       const failures = new Set<NonNullable<Journey["waitReason"]>>();
       const idle = reachableIdlePods(world, pickup);
-      for (const pod of idle) {
-        const origin = berthsById.get(pod.berthId!)!;
-        const emptyLength = trackPathLength(world, origin.point, pickup.point)!;
-        const earliestBoardEnd =
-          world.time +
-          (emptyLength * CELL_METERS) / POD_METERS_PER_SECOND +
-          BOARD_SECONDS;
-        // Sorted reachable candidates may only be skipped once even an empty
-        // calendar cannot beat the incumbent. This is a bound, never a cap.
+      const candidates = idle
+        .flatMap((pod) => {
+          const origin = berthsById.get(pod.berthId!)!;
+          const emptyLength = trackPathLength(
+            navigation,
+            origin.point,
+            pickup.point,
+          );
+          if (emptyLength === null) return [];
+          const earliestBoardEnd =
+            world.time +
+            (emptyLength * CELL_METERS) / POD_METERS_PER_SECOND +
+            BOARD_SECONDS;
+          return dropoffs
+            .map((dropoff) => ({
+              pod,
+              dropoff,
+              lowerBound:
+                earliestBoardEnd +
+                loadedSeconds.get(dropoff.id)! +
+                ALIGHT_SECONDS,
+            }))
+            .filter((candidate) => Number.isFinite(candidate.lowerBound));
+        })
+        .sort((left, right) => left.lowerBound - right.lowerBound);
+      if (!candidates.length && idle.length) failures.add("disconnected");
+      for (const { pod, dropoff, lowerBound } of candidates) {
+        // All remaining pairs have an equal or worse optimistic door-to-door
+        // arrival. Only this proof, never a candidate quota, ends the search.
         if (
           best &&
-          earliestBoardEnd + minimumLoaded + ALIGHT_SECONDS >=
+          lowerBound >=
             best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
         )
           break;
-        for (const dropoff of dropoffs) {
-          if (
-            best &&
-            earliestBoardEnd +
-              loadedSeconds.get(dropoff.id)! +
-              ALIGHT_SECONDS >=
-              best.dropoffEnd! + egressSeconds.get(best.dropoffId!)! - 1e-9
-          )
-            continue;
-          yield;
-          const candidate = planService(world, pod, resident, pickup, dropoff);
-          if (!candidate.ok) {
-            failures.add(candidate.reason);
-            continue;
-          }
-          if (touchesPending(world, candidate.plan)) {
-            failures.add("track-busy");
-            continue;
-          }
-          if (
-            !best ||
-            candidate.plan.dropoffEnd! + egressSeconds.get(dropoff.id)! <
-              best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!
-          )
-            best = candidate.plan;
+        yield;
+        const candidate = planService(
+          world,
+          pod,
+          resident,
+          pickup,
+          dropoff,
+          best
+            ? best.dropoffEnd! +
+                egressSeconds.get(best.dropoffId!)! -
+                egressSeconds.get(dropoff.id)!
+            : Infinity,
+        );
+        if (!candidate.ok) {
+          failures.add(candidate.reason);
+          continue;
         }
+        if (touchesPending(world, candidate.plan)) {
+          failures.add("track-busy");
+          continue;
+        }
+        if (
+          !best ||
+          candidate.plan.dropoffEnd! + egressSeconds.get(dropoff.id)! <
+            best.dropoffEnd! + egressSeconds.get(best.dropoffId!)!
+        )
+          best = candidate.plan;
       }
       reason =
         (

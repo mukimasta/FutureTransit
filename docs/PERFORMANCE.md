@@ -1,4 +1,30 @@
-# Peak-load optimization — MVP v0.0.10
+# Peak-load optimization — MVP v0.0.11
+
+## v0.0.11 morning dispatch: proof-based pruning
+
+Input: `future-transit-7-0852.json`, time 525153, 736 residents, 147 Pods (86 idle), 1,012 tracks and 10,898 reservations. Two three-lane tracks are pending demolition. Baseline is `71d3d8d` (v0.0.10).
+
+The earlier instrumented 12-city-second baseline made 3,537 feasible service computations, then rejected 3,492 (98.7%) because they touched pending construction. It made 69,303 departure searches and built 373 calendars. These are pre-change profiling results, not counters collected by the normal benchmark.
+
+For 120 city seconds, baseline simulation took 81,366 ms (worst step 7,585 ms); the new implementation measured 3,535 and 3,633 ms across two local runs, approximately 22–23× faster. Both baseline and optimized completed 13 deliveries. Unassigned waiting at the end improved from 5 to 0; optimized idle Pods: 73. Final optimized worst step was 1,128 ms and P95 was 120 ms. Delta capture/clone/apply averaged 5.21/1.52/0.17 ms and ~323 KB diagnostic JSON. Both runs passed lossless reconstruction and final-save trajectory validation. A cold individual search can still stall simulation for over a second; this is not a browser FPS claim or a guarantee for every network.
+
+### Search contract
+
+- Pair idle Pods with destination stations and sort by optimistic door-to-door arrival: current time + shortest empty travel + boarding + shortest loaded travel + alighting + egress walk. All waiting/conflict costs are nonnegative. Once the next lower bound cannot beat the incumbent actual arrival, all later pairs can be skipped.
+- Subtract a candidate station's egress time before passing the exclusive drop-off deadline into `planService`. Route free-flow bounds, per-lane shared-prefix departure floors, terminal-group floors, and departure-window deadlines prune internally. Prune terminal groups **before** constructing their templates. Unknown prefix bounds prove nothing and do not prune. Equal door-to-door arrivals need not replace the caller's incumbent; internal searches retain secondary parking/lane tie handling.
+- No fleet-size cap and no first-feasible shortcut. Removed the old cross-Pod failed-ride heuristic and the service detour shortcuts that assumed a failed shortest route ruled out detours or that one winning parking berth was sufficient for every detour.
+- Optimality here concerns the scheduler's **supported candidates**, not every possible city route or a globally optimal fleet schedule. Existing route-option generation, single-leg detour combinations, three lane profiles, shortest parking legs, 1,800-second planning window and bounded departure-search iterations remain. Requests are still handled in waiting order; the existing retry policy remains.
+- Pending track/node closures enter a cached navigation-only view. Actual trajectories, safety resources, calendar conflicts and atomic commits still use the physical world. Existing plans are untouched. Pending-berth occupants may still evacuate from their own origin, but ordinary service cannot use pending berths. Cancellation/topology changes invalidate the view.
+- Build one shared calendar per planning state, then rebuild only resources carrying the queried Pod's own commitments. Other Pods' finite reservations and indefinite terminal holds remain. Clock, fleet-plan/berth, topology, pending edits and reservation changes invalidate dynamic results. A bounded failure uses a distinct cache key and cannot poison an unbounded query. Production reservation-content updates continue to use replacement arrays; in-place length changes are also detected.
+
+### Verification
+
+- `node scripts/audit-service-pruning.mjs`: builds a separate reference bundle with service arrival pruning, prefix floors and incumbent departure cutoffs disabled, enumerating the existing route/terminal/lane candidates. All 48 Pod cases across 24 seeded single/shared-lane and congestion fixtures matched reference feasibility/earliest arrival; cross-Pod incumbent results matched exhaustive evaluation. This is differential testing, not an independent implementation of route generation or reservation safety.
+- Added regressions for a completely blocked shortest route with a usable detour, deadline cache isolation, cutoff equality, pending-track exclusion/cancellation, preservation of active plans, own-versus-other calendar occupancy and in-place reservation insertion.
+- Full suite: 166 passed, one known pre-existing failure in `adversarial.test.ts` expecting the retired spare-turnover rule (detailed below). No new failures. All 61 focused scheduler/integration/fleet/construction/demolition/motion/persistence/delta tests passed, as did the pruning audit, type checking, GitHub Pages build and local-root build. Local preview output is restored to the root base path.
+- The previous `future-transit-7-1509.json` is no longer present at its supplied Downloads path, so its v0.0.11 regression could not be rerun. The afternoon results below are historical v0.0.10 results, not measurements of this release.
+
+## v0.0.10 retained measurement record
 
 ## Reproduce
 

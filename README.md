@@ -1,6 +1,6 @@
 # FutureTransit MVP
 
-当前版本：**MVP v0.0.10** · [更新记录](CHANGELOG.md)。版本沿用 `mvp v0.0.1` 的发布编号，项目配置与锁文件保持一致。
+当前版本：**MVP v0.0.11** · [更新记录](CHANGELOG.md)。版本沿用 `mvp v0.0.1` 的发布编号，项目配置与锁文件保持一致。
 
 FutureTransit 是一个可玩的、双语的城市交通沙盒：居民会在建筑之间步行或乘坐 Pod，玩家铺设 8 方向网格轨道、配置平台与停车位，并观察有限容量下的真实接送。运行时由 React/SVG 界面、TypeScript 模拟和 Web Worker 组成；Worker 拥有唯一的 World 状态。
 

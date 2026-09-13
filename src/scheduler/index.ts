@@ -23,6 +23,7 @@ import {
   movementResourceOptions,
   nodeKey,
   trackPathLength,
+  trackResources,
 } from "../network";
 import {
   assertTrajectory,
@@ -70,7 +71,66 @@ const pathIds = new WeakMap<Point[], number>();
 let nextPathId = 0;
 const compiledWindows = new WeakMap<MotionSegment[], RelativeReservation[]>();
 const compiledOpenings = new WeakMap<MotionSegment[], RelativeReservation[]>();
+const navigationCaches = new WeakMap<
+  World,
+  {
+    stamp: string;
+    tracks: World["tracks"];
+    berths: Berth[];
+    view: World;
+  }
+>();
+
+/** Navigation only: physical reservation resources always use the real world. */
+export function planningNetwork(world: World): World {
+  if (!world.pendingEdits.length) return world;
+  const stamp = JSON.stringify([world.networkVersion, world.pendingEdits]);
+  const cached = navigationCaches.get(world);
+  if (
+    cached?.stamp === stamp &&
+    cached.tracks === world.tracks &&
+    cached.berths === world.berths
+  )
+    return cached.view;
+  const nodes = new Set<string>();
+  const resources = new Set<string>();
+  for (const edit of world.pendingEdits) {
+    if (edit.type !== "remove-track" && edit.type !== "upgrade-track") continue;
+    const track = world.tracks.find((item) => item.id === edit.id);
+    if (!track) continue;
+    if (edit.type === "remove-track") {
+      nodes.add(nodeKey(track.a));
+      nodes.add(nodeKey(track.b));
+    }
+    for (const resource of trackResources(world, track))
+      resources.add(resource);
+  }
+  const view = {
+    ...world,
+    tracks: world.tracks.filter(
+      (track) =>
+        !nodes.has(nodeKey(track.a)) &&
+        !nodes.has(nodeKey(track.b)) &&
+        !trackResources(world, track).some((resource) =>
+          resources.has(resource),
+        ),
+    ),
+    berths: world.berths.filter(
+      (berth) =>
+        !nodes.has(nodeKey(berth.point)) && !nodes.has(nodeKey(berth.access)),
+    ),
+  };
+  navigationCaches.set(world, {
+    stamp,
+    tracks: world.tracks,
+    berths: world.berths,
+    view,
+  });
+  return view;
+}
+
 function geometryCache(world: World): GeometryCache {
+  world = planningNetwork(world);
   let cache = geometryCaches.get(world);
   if (
     !cache ||
@@ -102,7 +162,7 @@ function route(world: World, from: Berth, to: Berth) {
   const key = `single:${from.id}:${to.id}`;
   const cached = cache.paths.get(key);
   if (cached) return cached[0] ?? null;
-  const path = findTrackPath(world, from.point, to.point);
+  const path = findTrackPath(planningNetwork(world), from.point, to.point);
   if (cache.paths.size >= 4096)
     cache.paths.delete(cache.paths.keys().next().value!);
   cache.paths.set(key, path ? [path] : []);
@@ -121,7 +181,11 @@ function routeOptions(world: World, from: Berth, to: Berth): Point[][] {
   const key = `options:${from.id}:${to.id}`;
   const cached = cache.paths.get(key);
   if (cached) return cached;
-  const paths = findTrackPathOptions(world, from.point, to.point);
+  const paths = findTrackPathOptions(
+    planningNetwork(world),
+    from.point,
+    to.point,
+  );
   if (cache.paths.size >= 4096)
     cache.paths.delete(cache.paths.keys().next().value!);
   cache.paths.set(key, paths);
@@ -201,7 +265,7 @@ function routeVariants(empties: Point[][], loadeds: Point[][]): RouteVariant[] {
 /** Length of `route`, or null where `route` yields nothing usable. */
 function routeLength(world: World, from: Berth, to: Berth): number | null {
   if (samePoint(from.point, to.point)) return 0;
-  return trackPathLength(world, from.point, to.point);
+  return trackPathLength(planningNetwork(world), from.point, to.point);
 }
 
 function terminalOwners(world: World, berthId: string): string[] {
@@ -512,6 +576,7 @@ function latestEndBefore(calendar: ResourceCalendar, limit: number): number {
  */
 interface CalendarCache {
   reservations: Reservation[];
+  reservationCount: number;
   pods: Pod[];
   berths: Berth[];
   networkVersion: number;
@@ -523,7 +588,8 @@ interface CalendarCache {
   byService: Map<string, ServiceOutcome>;
   owners?: Map<string, string[]>;
   shared?: Map<string, ResourceCalendar>;
-  rides?: Map<string, boolean>;
+  blocksByResource?: Map<string, TimedBlock[]>;
+  ownedResources?: Map<string, Set<string>>;
   parking?: Map<string, number>;
 }
 
@@ -553,10 +619,10 @@ const calendarCaches = new WeakMap<World, CalendarCache>();
 const PLAN_STAMP_FIELDS = 4;
 
 function pendingMatches(cache: CalendarCache, world: World): boolean {
-  if (cache.pendingEdits === world.pendingEdits) return true;
   if (cache.pendingIds.length !== world.pendingEdits.length) return false;
   for (let index = 0; index < world.pendingEdits.length; index += 1)
-    if (cache.pendingIds[index] !== world.pendingEdits[index].id) return false;
+    if (cache.pendingIds[index] !== JSON.stringify(world.pendingEdits[index]))
+      return false;
   return true;
 }
 
@@ -596,6 +662,7 @@ function planningCache(world: World): CalendarCache {
   if (
     cache &&
     cache.reservations === world.reservations &&
+    cache.reservationCount === world.reservations.length &&
     cache.pods === world.pods &&
     cache.berths === world.berths &&
     cache.networkVersion === world.networkVersion &&
@@ -606,11 +673,12 @@ function planningCache(world: World): CalendarCache {
     return cache;
   const fresh: CalendarCache = {
     reservations: world.reservations,
+    reservationCount: world.reservations.length,
     pods: world.pods,
     berths: world.berths,
     networkVersion: world.networkVersion,
     pendingEdits: world.pendingEdits,
-    pendingIds: world.pendingEdits.map((edit) => edit.id),
+    pendingIds: world.pendingEdits.map((edit) => JSON.stringify(edit)),
     time: world.time,
     stamp: planStamp(world.pods),
     byPod: new Map(),
@@ -620,34 +688,6 @@ function planningCache(world: World): CalendarCache {
   return fresh;
 }
 
-/**
- * Whether a ride between two platforms was found to fit the planning window.
- *
- * Dispatch asks Pod after Pod about the same ride, and the run with the
- * passenger aboard — much the longest part of it — is the same journey
- * whichever Pod turns up. So once a ride has been weighed against the window
- * for real, the answer is kept and the rest of the fleet is spared the search.
- *
- * Pods are offered nearest first, so a Pod asked later brings a longer approach
- * and a longer plan with it. Taking the first Pod's verdict for the ones behind
- * it is therefore a judgement, not a proof: their own blocking could in
- * principle clear sooner than the nearest Pod's. Measured over a rush-hour
- * pass, no ride the nearest Pod could not fit was ever fitted by another.
- */
-function rideFitsWindow(world: World, pickup: Berth, dropoff: Berth): boolean {
-  return planningCache(world).rides?.get(rideKey(pickup, dropoff)) ?? true;
-}
-
-function rideKey(pickup: Berth, dropoff: Berth): string {
-  return `${pickup.id}\u0000${dropoff.id}`;
-}
-
-/** Records that a ride ran past the planning window however it was arranged. */
-function rideMissedWindow(world: World, pickup: Berth, dropoff: Berth): void {
-  const cache = planningCache(world);
-  (cache.rides ??= new Map()).set(rideKey(pickup, dropoff), false);
-}
-
 function blockedResources(
   world: World,
   podId: string,
@@ -655,7 +695,30 @@ function blockedResources(
   const cache = planningCache(world);
   const cached = cache.byPod.get(podId);
   if (cached) return cached;
-  const calendars = buildCalendars(existingBlocks(world, new Set([podId])));
+  if (!cache.shared) {
+    const blocks = existingBlocks(world, new Set());
+    cache.shared = buildCalendars(blocks);
+    cache.blocksByResource = new Map();
+    cache.ownedResources = new Map();
+    for (const block of blocks) {
+      const group = cache.blocksByResource.get(block.resource) ?? [];
+      group.push(block);
+      cache.blocksByResource.set(block.resource, group);
+      const owned =
+        cache.ownedResources.get(block.ownerId) ?? new Set<string>();
+      owned.add(block.resource);
+      cache.ownedResources.set(block.ownerId, owned);
+    }
+  }
+  // Share every unaffected calendar; remove only this Pod's own commitments.
+  const calendars = new Map(cache.shared);
+  for (const resource of cache.ownedResources!.get(podId) ?? []) {
+    const others = cache
+      .blocksByResource!.get(resource)!
+      .filter((block) => block.ownerId !== podId);
+    if (!others.length) calendars.delete(resource);
+    else calendars.set(resource, buildCalendars(others).get(resource)!);
+  }
   cache.byPod.set(podId, calendars);
   return calendars;
 }
@@ -899,12 +962,15 @@ function searchDeparture(
   prefixLength: number,
   floor: number,
   blockers?: Set<string>,
+  departureLimit = Infinity,
 ): Departure | null {
   const relative = relativeReservations(world, template, prefix, prefixLength);
   const duration = template[template.length - 1]?.end ?? 0;
   if (duration > PLANNING_WINDOW_SECONDS + EPSILON) return null;
-  const latestDeparture =
-    world.time + Math.max(0, PLANNING_WINDOW_SECONDS - duration);
+  const latestDeparture = Math.min(
+    departureLimit,
+    world.time + Math.max(0, PLANNING_WINDOW_SECONDS - duration),
+  );
   // Nothing this candidate owes can be met before the run it shares with every
   // other candidate has cleared, so the search opens there rather than walking
   // the same jumps up to it once per terminal.
@@ -1161,6 +1227,9 @@ function computeServiceTemplate(
  * is shared by everyone waiting for the same Pod between the same platforms —
  * the common case in a rush-hour queue. Segments and reservations are copied
  * out of the shared result so no two callers ever hold the same arrays.
+ * `latestArrival` is an exclusive drop-off deadline, after the caller subtracts
+ * egress walking time from its incumbent door-to-door arrival. Failure under a
+ * deadline says nothing about unbounded feasibility; its cache key is separate.
  */
 export function planService(
   world: World,
@@ -1168,12 +1237,13 @@ export function planService(
   resident: Resident,
   pickup: Berth,
   dropoff: Berth,
+  latestArrival = Infinity,
 ): PlanResult {
   const cache = planningCache(world);
-  const key = `${pod.id}\u0000${pickup.id}\u0000${dropoff.id}`;
+  const key = `${pod.id}\u0000${pickup.id}\u0000${dropoff.id}\u0000${latestArrival}`;
   let outcome = cache.byService.get(key);
   if (!outcome) {
-    outcome = computeService(world, pod, pickup, dropoff);
+    outcome = computeService(world, pod, pickup, dropoff, latestArrival);
     cache.byService.set(key, outcome);
   }
   if (!outcome.ok) return { ok: false, reason: outcome.reason };
@@ -1209,6 +1279,7 @@ function computeService(
   pod: Pod,
   pickup: Berth,
   dropoff: Berth,
+  latestArrival: number,
 ): ServiceOutcome {
   const podFailure = idlePodFailure(pod);
   if (podFailure) return podFailure;
@@ -1225,16 +1296,17 @@ function computeService(
   const origin = world.berths.find((berth) => berth.id === pod.berthId);
   if (!origin) return { ok: false, reason: "no-pod" };
   if (
+    world.pendingEdits.some((edit) =>
+      [origin.id, actualPickup.id, actualDropoff.id].includes(edit.id),
+    )
+  )
+    return { ok: false, reason: "platform-busy" };
+  if (
     occupiedByIdlePod(world, actualPickup.id, pod.id) ||
     occupiedByIdlePod(world, actualDropoff.id, pod.id)
   ) {
     return { ok: false, reason: "platform-busy" };
   }
-
-  // Whether this ride fits at all is the same question for every Pod, so it is
-  // asked once rather than once per Pod that could take it.
-  if (!rideFitsWindow(world, actualPickup, actualDropoff))
-    return { ok: false, reason: "track-busy" };
 
   const emptyRoutes = routeOptions(world, origin, actualPickup);
   const loadedRoutes = routeOptions(world, actualPickup, actualDropoff);
@@ -1257,8 +1329,6 @@ function computeService(
     };
   }
 
-  // Set where the planning window, not the fleet, is what ruled a plan out.
-  let unfittable = false;
   let best:
     | {
         terminal: TerminalCandidate;
@@ -1272,46 +1342,29 @@ function computeService(
   const variants = routeVariants(emptyRoutes, loadedRoutes);
   const blockers = new Set<string>();
   for (let variant = 0; variant < variants.length; variant += 1) {
-    const { emptyPath, loadedPath, diverted } = variants[variant];
-    // Going the long way only ever helps by missing something. Nothing stood in
-    // the shortest route's way, or the rerouted leg would meet all of it
-    // anyway: either way there is no point searching it, and the shortest route
-    // keeps the exact cost it had before detours existed. Only the leg that
-    // changed is weighed — the one that did not is travelled at another time,
-    // and its own crowding is not this detour's to answer for.
-    // Where to park is a question about the tail, and a detour changes the run
-    // before it: once a berth has won that question outright, a rerouted run is
-    // measured against it there rather than reopening all of them.
-    const anchor = variant === 0 ? null : best;
-    if (variant > 0) {
-      // A longer way round is how a plan gets better, not how one comes to
-      // exist: where the shortest route found nothing inside the planning
-      // window, a route that takes longer to walk does not fit either.
-      if (!anchor || !blockers.size) break;
-      if (!relieves(blockers, routeFootprint(world, [diverted]))) continue;
-    }
-    // The soonest a detour could ever deliver is by leaving this instant and
-    // never stopping. Where even that loses to the incumbent, nothing inside
-    // this variant can win, and the whole terminal-by-lane search is skipped —
-    // so an uncontested shortest route costs exactly what it always did.
-    if (best) {
-      const earliest =
-        world.time +
-        travelSeconds(emptyPath) +
-        BOARD_SECONDS +
-        travelSeconds(loadedPath) +
-        ALIGHT_SECONDS;
-      const incumbent = best.template.dropoffEnd + best.scheduled.departure;
-      if (earliest >= incumbent - EPSILON) continue;
-    }
+    const { emptyPath, loadedPath } = variants[variant];
+    const duration =
+      travelSeconds(emptyPath) +
+      BOARD_SECONDS +
+      travelSeconds(loadedPath) +
+      ALIGHT_SECONDS;
+    const cannotImprove = (arrival: number) =>
+      arrival >= latestArrival - EPSILON ||
+      (best !== undefined &&
+        arrival >
+          best.template.dropoffEnd + best.scheduled.departure + EPSILON);
+    // These are optimistic bounds, not guesses about which detour/Pod works.
+    if (cannotImprove(world.time + duration)) continue;
     // One opening per lane profile, shared by every terminal that follows.
     const openings: (RelativeReservation[] | undefined)[] = [];
     const bounds: OpeningBound[] = [];
     // A floor bounds nothing until every lane profile has been weighed, and
     // they all are while the first terminal is priced — so from the second on.
     let floor: number | null = null;
-    const scope = anchor ? [anchor.terminal] : terminals;
+    const scope = terminals;
     for (let index = 0; index < scope.length; index += 1) {
+      // Prune the group before constructing any of its terminal templates.
+      if (floor !== null && cannotImprove(floor + duration)) break;
       const terminal = scope[index];
       if (!pathIsUsable(terminal.relocationPath)) continue;
       let hopeless = false;
@@ -1334,9 +1387,8 @@ function computeService(
         if (!opening) {
           opening = openingReservations(world, template);
           openings[laneProfile] = opening;
-          // A floor earns its scan by cutting a list of terminals short. Where
-          // a rerouted run is only being measured against the berth that
-          // already won, there is no list, and no floor is worked out.
+          // A shared prefix floor earns its scan by pruning later terminals.
+          // With only one terminal, the full departure scan suffices.
           bounds[laneProfile] =
             scope.length > 1
               ? openingFloor(
@@ -1356,10 +1408,16 @@ function computeService(
           floor + (template.segments[template.segments.length - 1]?.end ?? 0) >
             world.time + PLANNING_WINDOW_SECONDS + EPSILON
         ) {
-          unfittable = true;
           hopeless = true;
           break;
         }
+        const bound = bounds[laneProfile];
+        if (
+          bound.kind === "never" ||
+          (bound.kind === "clears" &&
+            cannotImprove(bound.at + template.dropoffEnd))
+        )
+          continue;
         const signature = template.segments
           .filter((segment) => segment.kind === "move")
           .map((segment) => segment.resources.join("|"))
@@ -1377,9 +1435,16 @@ function computeService(
           template.prefixLength,
           floor ?? world.time,
           variant === 0 ? blockers : undefined,
+          Math.min(
+            latestArrival,
+            best
+              ? best.template.dropoffEnd + best.scheduled.departure + EPSILON
+              : Infinity,
+          ) - template.dropoffEnd,
         );
         if (!scheduled) continue;
         const arrival = template.dropoffEnd + scheduled.departure;
+        if (arrival >= latestArrival - EPSILON) continue;
         const bestArrival = best
           ? best.template.dropoffEnd + best.scheduled.departure
           : Number.POSITIVE_INFINITY;
@@ -1442,7 +1507,6 @@ function computeService(
     }
   }
   if (!best) {
-    if (unfittable) rideMissedWindow(world, actualPickup, actualDropoff);
     return { ok: false, reason: "track-busy" };
   }
   const { departure } = best.scheduled;
