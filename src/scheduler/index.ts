@@ -360,10 +360,13 @@ function mergeCalendar(reservations: Reservation[]): Reservation[] {
   );
 }
 
-function terminalBlocks(world: World, exceptPodId: string): TimedBlock[] {
+function terminalBlocks(
+  world: World,
+  excluded: ReadonlySet<string>,
+): TimedBlock[] {
   const blocks: TimedBlock[] = [];
   for (const pod of world.pods) {
-    if (pod.id === exceptPodId) continue;
+    if (excluded.has(pod.id)) continue;
     if (pod.plan) {
       if (pod.berthId && pod.plan.departure > world.time) {
         blocks.push({
@@ -400,17 +403,20 @@ function overlaps(
   return leftStart < rightEnd - EPSILON && rightStart < leftEnd - EPSILON;
 }
 
-function existingBlocks(world: World, podId: string): TimedBlock[] {
+function existingBlocks(
+  world: World,
+  excluded: ReadonlySet<string>,
+): TimedBlock[] {
   const blocks: TimedBlock[] = [];
   for (const reservation of world.reservations)
     if (
-      reservation.ownerId !== podId &&
+      !excluded.has(reservation.ownerId) &&
       Number.isFinite(reservation.start) &&
       Number.isFinite(reservation.end) &&
       reservation.end > world.time
     )
       blocks.push(reservation);
-  for (const block of terminalBlocks(world, podId)) blocks.push(block);
+  for (const block of terminalBlocks(world, excluded)) blocks.push(block);
   return blocks;
 }
 
@@ -459,6 +465,9 @@ interface CalendarCache {
   byPod: Map<string, Map<string, ResourceCalendar>>;
   byService: Map<string, ServiceOutcome>;
   owners?: Map<string, string[]>;
+  shared?: Map<string, ResourceCalendar>;
+  rides?: Map<string, boolean>;
+  parking?: Map<string, number>;
 }
 
 /**
@@ -554,6 +563,34 @@ function planningCache(world: World): CalendarCache {
   return fresh;
 }
 
+/**
+ * Whether a ride between two platforms was found to fit the planning window.
+ *
+ * Dispatch asks Pod after Pod about the same ride, and the run with the
+ * passenger aboard — much the longest part of it — is the same journey
+ * whichever Pod turns up. So once a ride has been weighed against the window
+ * for real, the answer is kept and the rest of the fleet is spared the search.
+ *
+ * Pods are offered nearest first, so a Pod asked later brings a longer approach
+ * and a longer plan with it. Taking the first Pod's verdict for the ones behind
+ * it is therefore a judgement, not a proof: their own blocking could in
+ * principle clear sooner than the nearest Pod's. Measured over a rush-hour
+ * pass, no ride the nearest Pod could not fit was ever fitted by another.
+ */
+function rideFitsWindow(world: World, pickup: Berth, dropoff: Berth): boolean {
+  return planningCache(world).rides?.get(rideKey(pickup, dropoff)) ?? true;
+}
+
+function rideKey(pickup: Berth, dropoff: Berth): string {
+  return `${pickup.id}\u0000${dropoff.id}`;
+}
+
+/** Records that a ride ran past the planning window however it was arranged. */
+function rideMissedWindow(world: World, pickup: Berth, dropoff: Berth): void {
+  const cache = planningCache(world);
+  (cache.rides ??= new Map()).set(rideKey(pickup, dropoff), false);
+}
+
 function blockedResources(
   world: World,
   podId: string,
@@ -561,7 +598,7 @@ function blockedResources(
   const cache = planningCache(world);
   const cached = cache.byPod.get(podId);
   if (cached) return cached;
-  const calendars = computeBlockedResources(world, podId);
+  const calendars = buildCalendars(existingBlocks(world, new Set([podId])));
   cache.byPod.set(podId, calendars);
   return calendars;
 }
@@ -571,12 +608,9 @@ function blockedResources(
  * the world and the Pod, so one planning call shares it across every terminal,
  * lane profile and candidate departure it tries.
  */
-function computeBlockedResources(
-  world: World,
-  podId: string,
-): Map<string, ResourceCalendar> {
+function buildCalendars(blocks: TimedBlock[]): Map<string, ResourceCalendar> {
   const grouped = new Map<string, TimedBlock[]>();
-  for (const block of existingBlocks(world, podId)) {
+  for (const block of blocks) {
     const entries = grouped.get(block.resource);
     if (entries) entries.push(block);
     else grouped.set(block.resource, [block]);
@@ -1089,6 +1123,11 @@ function computeService(
     return { ok: false, reason: "platform-busy" };
   }
 
+  // Whether this ride fits at all is the same question for every Pod, so it is
+  // asked once rather than once per Pod that could take it.
+  if (!rideFitsWindow(world, actualPickup, actualDropoff))
+    return { ok: false, reason: "track-busy" };
+
   const emptyRoutes = routeOptions(world, origin, actualPickup);
   const loadedRoutes = routeOptions(world, actualPickup, actualDropoff);
   if (!emptyRoutes.length || !loadedRoutes.length) {
@@ -1110,6 +1149,8 @@ function computeService(
     };
   }
 
+  // Set where the planning window, not the fleet, is what ruled a plan out.
+  let unfittable = false;
   let best:
     | {
         terminal: TerminalCandidate;
@@ -1215,6 +1256,7 @@ function computeService(
           floor + (template.segments[template.segments.length - 1]?.end ?? 0) >
             world.time + PLANNING_WINDOW_SECONDS + EPSILON
         ) {
+          unfittable = true;
           hopeless = true;
           break;
         }
@@ -1299,7 +1341,10 @@ function computeService(
       }
     }
   }
-  if (!best) return { ok: false, reason: "track-busy" };
+  if (!best) {
+    if (unfittable) rideMissedWindow(world, actualPickup, actualDropoff);
+    return { ok: false, reason: "track-busy" };
+  }
   const { departure } = best.scheduled;
   const committed = commitDeparture(
     world,
@@ -1508,7 +1553,7 @@ export function commitPlan(world: World, plan: ServicePlan): void {
   ) {
     throw new Error(`Cannot commit plan ${plan.id}: invalid reservation`);
   }
-  const blocks = existingBlocks(world, plan.podId);
+  const blocks = existingBlocks(world, new Set([plan.podId]));
   // Only blocks on the same resource can conflict, and grouping keeps them in
   // the order a scan of the whole list would have met them, so the first
   // conflict reported is still the first conflict there is.
