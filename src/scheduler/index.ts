@@ -752,32 +752,43 @@ function scanDeparture(scan: WindowScan, departure: number): number {
   return jump;
 }
 
+/** What is known about when a shared opening can be left. */
+type OpeningBound =
+  { kind: "clears"; at: number } | { kind: "never" } | { kind: "unknown" };
+
 /**
  * The soonest a shared opening could be left, whatever a candidate does after.
  *
  * Every terminal a service might park at owes these same windows first, so none
  * of them can leave before the opening clears. That makes this a floor under
- * every candidate's departure, and reaching it is proof that no terminal
- * further down the list departs sooner.
+ * every candidate's departure, and it settles two questions at once: reaching
+ * the floor proves no terminal further down the list departs sooner, and a
+ * floor that leaves too little of the planning window for the run itself proves
+ * no terminal has a plan in it at all.
  *
- * Answers `null` where the opening runs into a hold that never ends, or takes
- * more attempts than the search itself allows: there is no useful floor then,
+ * `never` is a hold on the shared run that does not end, which no terminal can
+ * wait out. `unknown` is the search giving up first — nothing is proven then,
  * and every terminal is priced as it was before.
  */
 function openingFloor(
   world: World,
   opening: RelativeReservation[],
   calendars: Map<string, ResourceCalendar>,
-): number | null {
+  blockers?: Set<string>,
+): OpeningBound {
   const scan = beginScan(opening, calendars);
   let departure = world.time;
   for (let step = 0; step < MAX_SEARCH_STEPS; step += 1) {
     const jump = scanDeparture(scan, departure);
-    if (scan.never) return null;
-    if (jump <= departure + EPSILON) return departure;
+    if (scan.never) {
+      blockers?.add(scan.never);
+      return { kind: "never" };
+    }
+    if (jump <= departure + EPSILON) return { kind: "clears", at: departure };
+    if (scan.binding) blockers?.add(scan.binding);
     departure = jump;
   }
-  return null;
+  return { kind: "unknown" };
 }
 
 /**
@@ -793,6 +804,7 @@ function searchDeparture(
   calendars: Map<string, ResourceCalendar>,
   prefix: RelativeReservation[],
   prefixLength: number,
+  floor: number,
   blockers?: Set<string>,
 ): Departure | null {
   const relative = relativeReservations(world, template, prefix, prefixLength);
@@ -800,7 +812,10 @@ function searchDeparture(
   if (duration > PLANNING_WINDOW_SECONDS + EPSILON) return null;
   const latestDeparture =
     world.time + Math.max(0, PLANNING_WINDOW_SECONDS - duration);
-  let departure = world.time;
+  // Nothing this candidate owes can be met before the run it shares with every
+  // other candidate has cleared, so the search opens there rather than walking
+  // the same jumps up to it once per terminal.
+  let departure = Math.max(world.time, floor);
 
   const scan = beginScan(relative, calendars);
   const finalCalendar = calendars.get(berthResource(finalBerth.id));
@@ -1115,8 +1130,15 @@ function computeService(
     // keeps the exact cost it had before detours existed. Only the leg that
     // changed is weighed — the one that did not is travelled at another time,
     // and its own crowding is not this detour's to answer for.
+    // Where to park is a question about the tail, and a detour changes the run
+    // before it: once a berth has won that question outright, a rerouted run is
+    // measured against it there rather than reopening all of them.
+    const anchor = variant === 0 ? null : best;
     if (variant > 0) {
-      if (!blockers.size) break;
+      // A longer way round is how a plan gets better, not how one comes to
+      // exist: where the shortest route found nothing inside the planning
+      // window, a route that takes longer to walk does not fit either.
+      if (!anchor || !blockers.size) break;
       if (!relieves(blockers, routeFootprint(world, [diverted]))) continue;
     }
     // The soonest a detour could ever deliver is by leaving this instant and
@@ -1135,18 +1157,15 @@ function computeService(
     }
     // One opening per lane profile, shared by every terminal that follows.
     const openings: (RelativeReservation[] | undefined)[] = [];
-    const floors: (number | null)[] = [];
-    // A floor bounds nothing until every lane profile has one, and they are all
-    // worked out while the first terminal is priced — so from the second on.
+    const bounds: OpeningBound[] = [];
+    // A floor bounds nothing until every lane profile has been weighed, and
+    // they all are while the first terminal is priced — so from the second on.
     let floor: number | null = null;
-    // Where to park is a question about the tail, and a detour changes the run
-    // before it. Once a berth has won that question outright, a rerouted run is
-    // measured against it there rather than reopening all of them; where the
-    // shortest route found no plan at all, the whole list is still in play.
-    const scope = variant === 0 || !best ? terminals : [best.terminal];
+    const scope = anchor ? [anchor.terminal] : terminals;
     for (let index = 0; index < scope.length; index += 1) {
       const terminal = scope[index];
       if (!pathIsUsable(terminal.relocationPath)) continue;
+      let hopeless = false;
       const seenProfiles = new Set<string>();
       for (const laneProfile of [0, 1, 2]) {
         const template = serviceTemplate(
@@ -1174,7 +1193,30 @@ function computeService(
             ),
           );
           openings[laneProfile] = opening;
-          floors[laneProfile] = openingFloor(world, opening, calendars);
+          // A floor earns its scan by cutting a list of terminals short. Where
+          // a rerouted run is only being measured against the berth that
+          // already won, there is no list, and no floor is worked out.
+          bounds[laneProfile] =
+            scope.length > 1
+              ? openingFloor(
+                  world,
+                  opening,
+                  calendars,
+                  variant === 0 ? blockers : undefined,
+                )
+              : { kind: "unknown" };
+        }
+        // A candidate cannot leave before the opening every terminal shares has
+        // cleared. Where even that leaves the planning window too short for the
+        // run itself, this terminal has no plan in it — and nor has any
+        // terminal further out, since the list only reaches further from here.
+        if (
+          floor !== null &&
+          floor + (template.segments[template.segments.length - 1]?.end ?? 0) >
+            world.time + PLANNING_WINDOW_SECONDS + EPSILON
+        ) {
+          hopeless = true;
+          break;
         }
         const signature = template.segments
           .filter((segment) => segment.kind === "move")
@@ -1191,6 +1233,7 @@ function computeService(
           calendars,
           opening,
           template.prefixLength,
+          floor ?? world.time,
           variant === 0 ? blockers : undefined,
         );
         if (!scheduled) continue;
@@ -1225,12 +1268,19 @@ function computeService(
           best = { terminal, template, scheduled, laneProfile, variant };
         }
       }
-      if (
-        floor === null &&
-        floors.length === 3 &&
-        floors.every((f) => f !== null)
-      )
-        floor = Math.min(...(floors as number[]));
+      if (hopeless) break;
+      // A lane profile the opening never clears rules its own candidates out
+      // rather than lowering the bound; one the search gave up on proves
+      // nothing, and leaves every terminal to be priced as before.
+      if (floor === null && bounds.length === 3) {
+        const clears = bounds.flatMap((bound) =>
+          bound.kind === "clears" ? [bound.at] : [],
+        );
+        if (!clears.length && bounds.every((bound) => bound.kind === "never"))
+          break;
+        if (clears.length && bounds.every((bound) => bound.kind !== "unknown"))
+          floor = Math.min(...clears);
+      }
       // Nothing can leave before the opening every terminal shares has cleared,
       // so a terminal that leaves exactly then cannot be beaten to the drop-off
       // — and the list runs from the nearest parking berth outwards, so nothing
@@ -1349,6 +1399,7 @@ export function planRelocation(
         calendars,
         [],
         0,
+        world.time,
         variant === 0 ? blockers : undefined,
       );
       if (!candidate) continue;
