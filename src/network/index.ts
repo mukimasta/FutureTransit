@@ -53,6 +53,8 @@ interface ResourceIndex {
   dwellResources: Map<string, string[]>;
   trackGraph: Map<string, GraphEdge[]> | null;
   trackTrees: Map<string, TrackTree>;
+  trackAlternatives: Map<number | string, Point[][]>;
+  bridges: Set<string> | null;
 }
 const resourceIndexes = new WeakMap<World, ResourceIndex>();
 
@@ -100,6 +102,8 @@ function resourceIndex(world: World): ResourceIndex {
     dwellResources: new Map(),
     trackGraph: null,
     trackTrees: new Map(),
+    trackAlternatives: new Map(),
+    bridges: null,
   };
   resourceIndexes.set(world, index);
   return index;
@@ -1017,6 +1021,218 @@ function computeTrackPath(
   const tree = trackTree(world, from, startKey);
   if (!tree.points.has(endKey)) return null;
   return reconstructPath(tree.parents, tree.points, endKey);
+}
+
+/**
+ * How many routes a single origin-destination pair offers, the shortest one
+ * included, and how far past the shortest a detour may still be worth offering.
+ * A cell of track costs five seconds to cross, while a contested corridor
+ * routinely pushes a departure back by several hundred; the point of the cap is
+ * not to protect travel time — the planner compares arrivals and will refuse a
+ * slow detour on its own — but to keep the candidate list short.
+ */
+const MAX_ROUTE_ALTERNATIVES = 3;
+const DETOUR_LENGTH_RATIO = 1.6;
+/** Each earlier use of an edge makes it this much dearer to the next search. */
+const DETOUR_PENALTY = 2;
+
+const nodePairKey = (a: Point, b: Point) => {
+  const left = nodeKey(a);
+  const right = nodeKey(b);
+  return left < right ? `${left}|${right}` : `${right}|${left}`;
+};
+
+/**
+ * The edges no route can avoid — remove one and the network falls in two.
+ *
+ * A network grown by hanging each new stop off its nearest neighbour is made
+ * entirely of these, and so is every dead-end spur on a network that is not.
+ * Knowing them turns "is there another way round?" into a question answered by
+ * reading the route, rather than by searching for a second one and finding the
+ * first again.
+ */
+function bridgeEdges(world: World): Set<string> {
+  const index = resourceIndex(world);
+  if (index.bridges) return index.bridges;
+  const graph = trackGraph(world);
+  const bridges = new Set<string>();
+  const points = new Map<string, Point>();
+  for (const [key, neighbors] of graph)
+    for (const neighbor of neighbors) {
+      if (!points.has(key)) points.set(key, neighbor.point);
+      points.set(nodeKey(neighbor.point), neighbor.point);
+    }
+  const discovered = new Map<string, number>();
+  const low = new Map<string, number>();
+  let counter = 0;
+  // Tarjan, with the recursion spelled out: a long corridor is a deep tree.
+  for (const root of graph.keys()) {
+    if (discovered.has(root)) continue;
+    discovered.set(root, counter);
+    low.set(root, counter);
+    counter += 1;
+    const stack = [{ key: root, parent: null as string | null, next: 0 }];
+    while (stack.length) {
+      const frame = stack[stack.length - 1];
+      const neighbors = graph.get(frame.key) ?? [];
+      if (frame.next < neighbors.length) {
+        const child = nodeKey(neighbors[frame.next].point);
+        frame.next += 1;
+        // Edges are stored once each way, so the way back is not a second way.
+        if (child === frame.parent) continue;
+        const seen = discovered.get(child);
+        if (seen !== undefined) {
+          low.set(frame.key, Math.min(low.get(frame.key)!, seen));
+          continue;
+        }
+        discovered.set(child, counter);
+        low.set(child, counter);
+        counter += 1;
+        stack.push({ key: child, parent: frame.key, next: 0 });
+        continue;
+      }
+      stack.pop();
+      const parent = frame.parent;
+      if (parent === null) continue;
+      const reach = low.get(frame.key)!;
+      low.set(parent, Math.min(low.get(parent)!, reach));
+      if (reach > discovered.get(parent)!)
+        bridges.add(nodePairKey(points.get(parent)!, points.get(frame.key)!));
+    }
+  }
+  index.bridges = bridges;
+  return bridges;
+}
+
+/** A route made only of unavoidable edges has no alternative, by definition. */
+function routeIsForced(world: World, path: Point[]): boolean {
+  const bridges = bridgeEdges(world);
+  for (let index = 1; index < path.length; index += 1)
+    if (!bridges.has(nodePairKey(path[index - 1], path[index]))) return false;
+  return true;
+}
+
+/**
+ * The shortest route that avoids, as far as it can, the edges already spent.
+ * Penalising rather than deleting them keeps a route available where the
+ * network offers no genuine second corridor: the search still returns
+ * something, and the caller recognises the repeat and stops.
+ */
+function penalizedTrackPath(
+  world: World,
+  from: Point,
+  to: Point,
+  penalties: Map<string, number>,
+): Point[] | null {
+  const graph = trackGraph(world);
+  const index = resourceIndex(world);
+  const terminalKeys = index.berthsByPoint;
+  const startKey = nodeKey(from);
+  const endKey = nodeKey(to);
+  const distances = new Map<string, number>([[startKey, 0]]);
+  const parents = new Map<string, string>();
+  const pointsByKey = new Map<string, Point>([[startKey, { ...from }]]);
+  const settled = new Set<string>();
+  const unsettled = new Frontier<TrackEntry>(
+    (a, b) =>
+      a.cost < b.cost - EPSILON ||
+      (Math.abs(a.cost - b.cost) <= EPSILON && a.key < b.key),
+  );
+  unsettled.push({ key: startKey, point: from, cost: 0 });
+
+  while (unsettled.size) {
+    const entry = unsettled.pop();
+    const current = entry.key;
+    if (settled.has(current)) continue;
+    settled.add(current);
+    if (current === endKey) break;
+    // Berths are entered, never crossed: the same rule the plain search follows.
+    if (terminalKeys.has(current) && current !== startKey) continue;
+
+    const currentCost = distances.get(current)!;
+    for (const neighbor of graph.get(current) ?? []) {
+      const key = nodeKey(neighbor.point);
+      const used = penalties.get(edgeKey(entry.point, neighbor.point)) ?? 0;
+      const candidate =
+        currentCost + neighbor.cost * (1 + DETOUR_PENALTY * used);
+      if (
+        candidate <
+        (distances.get(key) ?? Number.POSITIVE_INFINITY) - EPSILON
+      ) {
+        distances.set(key, candidate);
+        parents.set(key, current);
+        pointsByKey.set(key, { ...neighbor.point });
+        unsettled.push({ key, point: neighbor.point, cost: candidate });
+      }
+    }
+  }
+  if (!settled.has(endKey)) return null;
+  return reconstructPath(parents, pointsByKey, endKey);
+}
+
+function samePath(left: Point[], right: Point[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1)
+    if (!samePoint(left[index], right[index])) return false;
+  return true;
+}
+
+/**
+ * Distinct routes between two points, shortest first.
+ *
+ * Every further route is the shortest one that leans away from the edges its
+ * predecessors already used, so the list walks outward through genuinely
+ * separate corridors instead of returning near-copies of the first. Kept per
+ * topology alongside the shortest-path trees: a pair is searched at most
+ * `MAX_ROUTE_ALTERNATIVES` times however often the planner asks for it.
+ */
+function trackAlternatives(world: World, from: Point, to: Point): Point[][] {
+  const shortest = storedPath(world, from, to, false);
+  if (!shortest) return [];
+  // Nothing to route around: a single hop has no interior to avoid, and a route
+  // that is all bridges is the only route there is.
+  if (shortest.length < 3 || routeIsForced(world, shortest)) return [shortest];
+
+  const index = resourceIndex(world);
+  const key = pathCacheKey(world, from, to, false);
+  const cached = index.trackAlternatives.get(key);
+  if (cached) return cached;
+
+  const routes = [shortest];
+  const limit = pathTotalLength(shortest) * DETOUR_LENGTH_RATIO + EPSILON;
+  const penalties = new Map<string, number>();
+  while (routes.length < MAX_ROUTE_ALTERNATIVES) {
+    const previous = routes[routes.length - 1];
+    for (let step = 1; step < previous.length; step += 1) {
+      const edge = edgeKey(previous[step - 1], previous[step]);
+      penalties.set(edge, (penalties.get(edge) ?? 0) + 1);
+    }
+    const candidate = penalizedTrackPath(world, from, to, penalties);
+    if (!candidate) break;
+    if (pathTotalLength(candidate) > limit) break;
+    if (routes.some((route) => samePath(route, candidate))) break;
+    routes.push(candidate);
+  }
+  index.trackAlternatives.set(key, routes);
+  return routes;
+}
+
+/**
+ * Every route worth considering between two points, shortest first. Callers get
+ * their own copies, as they do from `findTrackPath`.
+ */
+export function findTrackPathOptions(
+  world: World,
+  from: Point,
+  to: Point,
+): Point[][] {
+  if (!isGridPoint(from) || !isGridPoint(to)) return [];
+  if (samePoint(from, to)) return [[{ ...from }]];
+  const graph = trackGraph(world);
+  if (!graph.has(nodeKey(from)) || !graph.has(nodeKey(to))) return [];
+  return trackAlternatives(world, from, to).map((route) =>
+    route.map((point) => ({ x: point.x, y: point.y })),
+  );
 }
 
 const WALK_DIRECTIONS: Point[] = [

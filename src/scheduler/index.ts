@@ -10,6 +10,7 @@ import type {
   Berth,
   MotionSegment,
   PlanResult,
+  Point,
   Pod,
   Reservation,
   Resident,
@@ -18,6 +19,7 @@ import type {
 } from "../shared/types";
 import {
   findTrackPath,
+  findTrackPathOptions,
   movementResourceOptions,
   nodeKey,
   trackPathLength,
@@ -25,9 +27,11 @@ import {
 import {
   assertTrajectory,
   ensureRanked,
+  mergeSortedTrajectoryWindows,
+  mergeTrajectoryWindows,
   resourceRank,
   sortResources,
-  requiredTrajectoryWindows,
+  trajectoryWindowRange,
 } from "../shared/trajectory";
 
 const PLANNING_WINDOW_SECONDS = 1_800;
@@ -58,6 +62,87 @@ const berthResource = (berthId: string) => `${BERTH_RESOURCE_PREFIX}${berthId}`;
 function route(world: World, from: Berth, to: Berth) {
   if (samePoint(from.point, to.point)) return [from.point];
   return findTrackPath(world, from.point, to.point);
+}
+
+/**
+ * Every route this leg could take, shortest first.
+ *
+ * The scheduler cannot make a Pod wait halfway, so a contested corridor can
+ * only be answered by leaving later — or by going a different way. Offering the
+ * other ways here is what lets the search choose between the two.
+ */
+function routeOptions(world: World, from: Berth, to: Berth): Point[][] {
+  return findTrackPathOptions(world, from.point, to.point);
+}
+
+const travelSeconds = (path: Point[]) =>
+  (pathLength(path) * CELL_METERS) / POD_METERS_PER_SECOND;
+
+/**
+ * What a set of legs would occupy, listed generously enough to answer "would
+ * this route still run into that?" and no more. It deliberately stops short of
+ * the junction channels a full trajectory also books: missing one can only make
+ * a route look more promising than it is, which costs a search, while claiming
+ * one it does not use would hide a route that works.
+ */
+function routeFootprint(world: World, paths: Point[][]): Set<string> {
+  const footprint = new Set<string>();
+  for (const path of paths) {
+    for (let index = 0; index < path.length; index += 1) {
+      footprint.add(nodeKey(path[index]));
+      if (index === 0) continue;
+      for (const option of movementResourceOptions(
+        world,
+        path[index - 1],
+        path[index],
+      ))
+        for (const resource of option) footprint.add(resource);
+    }
+  }
+  return footprint;
+}
+
+/** Whether a route sidesteps anything that held the incumbent up. */
+function relieves(blockers: Set<string>, footprint: Set<string>): boolean {
+  for (const blocker of blockers) if (!footprint.has(blocker)) return true;
+  return false;
+}
+
+interface RouteVariant {
+  emptyPath: Point[];
+  loadedPath: Point[];
+  /** The leg this variant reroutes; the other one stays the shortest. */
+  diverted: Point[];
+}
+
+/**
+ * The leg pairings worth trying, the all-shortest one first.
+ *
+ * Only one leg is diverted at a time: two simultaneous detours cost more than
+ * they can usually recover, and the pairings would multiply rather than add.
+ * The loaded leg comes first at every depth because that is the one a passenger
+ * is sitting in.
+ */
+function routeVariants(empties: Point[][], loadeds: Point[][]): RouteVariant[] {
+  const variants: RouteVariant[] = [
+    { emptyPath: empties[0], loadedPath: loadeds[0], diverted: [] },
+  ];
+  const depth = Math.max(empties.length, loadeds.length);
+  for (let step = 1; step < depth; step += 1) {
+    if (step < loadeds.length)
+      variants.push({
+        emptyPath: empties[0],
+        loadedPath: loadeds[step],
+        diverted: loadeds[step],
+      });
+    if (step < empties.length)
+      variants.push({
+        emptyPath: empties[step],
+        loadedPath: loadeds[0],
+        diverted: empties[step],
+      });
+  }
+  return variants;
 }
 
 /** Length of `route`, or null where `route` yields nothing usable. */
@@ -222,11 +307,27 @@ function mergeRelativeReservations(
   return merged;
 }
 
+/**
+ * The windows a candidate owes, given the ones its shared opening already owes.
+ *
+ * Every terminal a service could park at replays the same run to the pickup and
+ * the same run with the passenger aboard; only the tail differs. The opening is
+ * derived once and handed in here, so what a terminal costs is the tail it adds
+ * rather than the whole trajectory over again.
+ */
 function relativeReservations(
   world: World,
   segments: MotionSegment[],
+  prefix: RelativeReservation[],
+  prefixLength: number,
 ): RelativeReservation[] {
-  return requiredTrajectoryWindows(world, segments, 1);
+  if (prefixLength >= segments.length) return prefix;
+  return mergeSortedTrajectoryWindows(
+    prefix,
+    mergeTrajectoryWindows(
+      trajectoryWindowRange(world, segments, prefixLength, segments.length, 1),
+    ),
+  );
 }
 
 function mergeReservations(
@@ -496,6 +597,61 @@ function computeBlockedResources(
   return calendars;
 }
 
+/**
+ * A departure the search has settled on, with the windows it was settled
+ * against.
+ *
+ * Out of the hundreds of candidates a plan weighs, exactly one is ever
+ * committed. What that costs to build — shifting every segment, merging every
+ * reservation — is therefore left to `commitDeparture`, and a losing candidate
+ * pays for none of it.
+ */
+interface Departure {
+  departure: number;
+  /** Owed windows relative to departure. Read-only: openings are shared. */
+  relative: RelativeReservation[];
+}
+
+/** When the whole plan ends, without building it. */
+function departureEnd(template: MotionSegment[], settled: Departure): number {
+  return settled.departure + (template[template.length - 1]?.end ?? 0);
+}
+
+/** The absolute segments and reservations a settled departure stands for. */
+function commitDeparture(
+  world: World,
+  pod: Pod,
+  origin: Berth,
+  template: MotionSegment[],
+  settled: Departure,
+): { segments: MotionSegment[]; reservations: Reservation[] } {
+  const { departure, relative } = settled;
+  return {
+    segments: absoluteSegments(template, departure),
+    reservations: mergeReservations(
+      [
+        ...relative.map((reservation) => ({
+          ...reservation,
+          start: reservation.start + departure,
+          end: reservation.end + departure,
+          ownerId: pod.id,
+        })),
+        ...(departure > world.time + EPSILON
+          ? [
+              {
+                resource: berthResource(origin.id),
+                start: world.time,
+                end: departure,
+                ownerId: pod.id,
+              },
+            ]
+          : []),
+      ],
+      pod.id,
+    ),
+  };
+}
+
 function absoluteSegments(
   segments: MotionSegment[],
   departure: number,
@@ -510,6 +666,124 @@ function absoluteSegments(
   }));
 }
 
+interface WindowScan {
+  contested: { window: RelativeReservation; calendar: ResourceCalendar }[];
+  cursors: Int32Array;
+  active: number;
+  /** The resource that set the jump last returned, where one did. */
+  binding: string | null;
+  /** A resource whose hold never ends, met on the last pass. */
+  never: string | null;
+}
+
+/**
+ * Prepares to weigh a trajectory's windows against what already holds them.
+ *
+ * Only the windows that can actually collide are kept; on a quiet resource
+ * there is nothing to compare against.
+ */
+function beginScan(
+  windows: RelativeReservation[],
+  calendars: Map<string, ResourceCalendar>,
+): WindowScan {
+  const contested: WindowScan["contested"] = [];
+  for (const proposed of windows) {
+    const calendar = calendars.get(proposed.resource);
+    if (calendar?.starts.length) contested.push({ window: proposed, calendar });
+  }
+  return {
+    contested,
+    cursors: new Int32Array(contested.length),
+    active: contested.length,
+    binding: null,
+    never: null,
+  };
+}
+
+/**
+ * The soonest departure after this one that some window still objects to, or
+ * this one when none does.
+ *
+ * Candidate departures only ever move forward, so each window's set of
+ * possibly-overlapping blocks only ever grows: a cursor walks it once in total
+ * instead of being re-derived on every attempt. A window whose blocks are all
+ * behind the candidate can never come back, so it leaves the scan for good and
+ * later attempts only look at what is still in the way. That state lives in the
+ * scan, so it must be walked forward in time and never reused for an earlier
+ * departure.
+ */
+function scanDeparture(scan: WindowScan, departure: number): number {
+  const { contested, cursors } = scan;
+  let jump = departure;
+  scan.binding = null;
+  scan.never = null;
+  for (let index = 0; index < scan.active; index += 1) {
+    const { window: proposed, calendar } = contested[index];
+    const starts = calendar.starts;
+    const limit = proposed.end + departure - EPSILON;
+    let cursor = cursors[index];
+    while (cursor < starts.length && starts[cursor] < limit) cursor += 1;
+    cursors[index] = cursor;
+    // Only the block reaching furthest past this window can set the jump;
+    // every other overlap it hides would move the departure less.
+    const blockedUntil =
+      cursor === 0 ? Number.NEGATIVE_INFINITY : calendar.runningEnd[cursor - 1];
+    if (!(proposed.start + departure < blockedUntil - EPSILON)) {
+      // Nothing is left to walk into and this window already clears what it
+      // found, so no later, later-still departure can be blocked by it.
+      if (cursor === starts.length) {
+        scan.active -= 1;
+        contested[index] = contested[scan.active];
+        cursors[index] = cursors[scan.active];
+        index -= 1;
+      }
+      continue;
+    }
+    if (!Number.isFinite(blockedUntil)) {
+      scan.never = proposed.resource;
+      return departure;
+    }
+    const candidate = blockedUntil - proposed.start;
+    if (candidate > jump) {
+      jump = candidate;
+      scan.binding = proposed.resource;
+    }
+  }
+  return jump;
+}
+
+/**
+ * The soonest a shared opening could be left, whatever a candidate does after.
+ *
+ * Every terminal a service might park at owes these same windows first, so none
+ * of them can leave before the opening clears. That makes this a floor under
+ * every candidate's departure, and reaching it is proof that no terminal
+ * further down the list departs sooner.
+ *
+ * Answers `null` where the opening runs into a hold that never ends, or takes
+ * more attempts than the search itself allows: there is no useful floor then,
+ * and every terminal is priced as it was before.
+ */
+function openingFloor(
+  world: World,
+  opening: RelativeReservation[],
+  calendars: Map<string, ResourceCalendar>,
+): number | null {
+  const scan = beginScan(opening, calendars);
+  let departure = world.time;
+  for (let step = 0; step < MAX_SEARCH_STEPS; step += 1) {
+    const jump = scanDeparture(scan, departure);
+    if (scan.never) return null;
+    if (jump <= departure + EPSILON) return departure;
+    departure = jump;
+  }
+  return null;
+}
+
+/**
+ * Records the resources that actually pushed a departure back, so a caller can
+ * tell whether going a different way would have met the same obstacle.
+ */
 function searchDeparture(
   world: World,
   pod: Pod,
@@ -517,127 +791,81 @@ function searchDeparture(
   finalBerth: Berth,
   template: MotionSegment[],
   calendars: Map<string, ResourceCalendar>,
-): {
-  departure: number;
-  segments: MotionSegment[];
-  reservations: Reservation[];
-} | null {
-  const relative = relativeReservations(world, template);
+  prefix: RelativeReservation[],
+  prefixLength: number,
+  blockers?: Set<string>,
+): Departure | null {
+  const relative = relativeReservations(world, template, prefix, prefixLength);
   const duration = template[template.length - 1]?.end ?? 0;
   if (duration > PLANNING_WINDOW_SECONDS + EPSILON) return null;
   const latestDeparture =
     world.time + Math.max(0, PLANNING_WINDOW_SECONDS - duration);
   let departure = world.time;
 
-  // Only the windows that can actually collide are rescanned per candidate
-  // departure; on a quiet resource there is nothing to compare against.
-  const contested: {
-    window: RelativeReservation;
-    calendar: ResourceCalendar;
-  }[] = [];
-  for (const proposed of relative) {
-    const calendar = calendars.get(proposed.resource);
-    if (calendar?.starts.length) contested.push({ window: proposed, calendar });
-  }
+  const scan = beginScan(relative, calendars);
   const finalCalendar = calendars.get(berthResource(finalBerth.id));
   const finalEnd = finalCalendar?.starts.length
     ? finalCalendar.runningEnd[finalCalendar.starts.length - 1]
     : Number.NEGATIVE_INFINITY;
-
-  // Candidate departures only ever move forward, so each window's set of
-  // possibly-overlapping blocks only ever grows: a cursor walks it once in
-  // total instead of being re-derived on every attempt. A window whose blocks
-  // are all behind the candidate can never come back, so it leaves the scan
-  // for good and later attempts only look at what is still in the way.
-  const cursors = new Int32Array(contested.length);
-  let active = contested.length;
 
   for (
     let step = 0;
     step < MAX_SEARCH_STEPS && departure <= latestDeparture + EPSILON;
     step += 1
   ) {
-    let jump = departure;
-    let impossible = false;
-    for (let index = 0; index < active; index += 1) {
-      const { window: proposed, calendar } = contested[index];
-      const starts = calendar.starts;
-      const limit = proposed.end + departure - EPSILON;
-      let cursor = cursors[index];
-      while (cursor < starts.length && starts[cursor] < limit) cursor += 1;
-      cursors[index] = cursor;
-      // Only the block reaching furthest past this window can set the jump;
-      // every other overlap it hides would move the departure less.
-      const blockedUntil =
-        cursor === 0
-          ? Number.NEGATIVE_INFINITY
-          : calendar.runningEnd[cursor - 1];
-      if (!(proposed.start + departure < blockedUntil - EPSILON)) {
-        // Nothing is left to walk into and this window already clears what it
-        // found, so no later, later-still departure can be blocked by it.
-        if (cursor === starts.length) {
-          active -= 1;
-          contested[index] = contested[active];
-          cursors[index] = cursors[active];
-          index -= 1;
-        }
-        continue;
-      }
-      if (!Number.isFinite(blockedUntil)) {
-        impossible = true;
-        break;
-      }
-      const candidate = blockedUntil - proposed.start;
-      if (candidate > jump) jump = candidate;
+    let jump = scanDeparture(scan, departure);
+    let binding = scan.binding;
+    if (scan.never) {
+      blockers?.add(scan.never);
+      return null;
     }
-    if (impossible) return null;
 
     // A final berth becomes a durable tail commitment at plan end. Delay the
     // entire plan until every already-approved finite visit to that berth is over.
     const proposedEnd = departure + duration;
     if (finalEnd > proposedEnd + EPSILON) {
-      if (!Number.isFinite(finalEnd)) return null;
-      jump = Math.max(jump, finalEnd - duration);
+      if (!Number.isFinite(finalEnd)) {
+        blockers?.add(berthResource(finalBerth.id));
+        return null;
+      }
+      if (finalEnd - duration > jump) {
+        jump = finalEnd - duration;
+        binding = berthResource(finalBerth.id);
+      }
     }
 
     if (jump <= departure + EPSILON) {
-      const segments = absoluteSegments(template, departure);
-      const reservations = mergeReservations(
-        [
-          ...relative.map((reservation) => ({
-            ...reservation,
-            start: reservation.start + departure,
-            end: reservation.end + departure,
-            ownerId: pod.id,
-          })),
-          ...(departure > world.time + EPSILON
-            ? [
-                {
-                  resource: berthResource(origin.id),
-                  start: world.time,
-                  end: departure,
-                  ownerId: pod.id,
-                },
-              ]
-            : []),
-        ],
-        pod.id,
-      );
-      if (
-        reservations.some((reservation) => {
-          const calendar = calendars.get(reservation.resource);
-          if (!calendar) return false;
-          const blockedUntil = latestEndBefore(
-            calendar,
-            reservation.end - EPSILON,
-          );
-          return reservation.start < blockedUntil - EPSILON;
-        })
-      ) {
-        return null;
+      // The scan above has cleared every window the trajectory owns. The one
+      // claim it never saw is the berth the Pod holds while it waits out a
+      // delayed departure, so that interval — joined to whatever the
+      // trajectory itself owes the same berth — is all that is left to check.
+      if (departure > world.time + EPSILON) {
+        const resource = berthResource(origin.id);
+        const held: RelativeReservation[] = [
+          { resource, start: world.time, end: departure },
+        ];
+        for (const window of relative) {
+          if (window.resource !== resource) continue;
+          held.push({
+            resource,
+            start: window.start + departure,
+            end: window.end + departure,
+          });
+        }
+        const calendar = calendars.get(resource);
+        if (calendar) {
+          for (const reservation of mergeRelativeReservations(held)) {
+            const blockedUntil = latestEndBefore(
+              calendar,
+              reservation.end - EPSILON,
+            );
+            if (reservation.start < blockedUntil - EPSILON) return null;
+          }
+        }
       }
-      return { departure, segments, reservations };
+      return { departure, relative };
     }
+    if (binding) blockers?.add(binding);
     departure = jump;
   }
   return null;
@@ -704,6 +932,7 @@ function serviceTemplate(
   laneProfile: number,
 ): {
   segments: MotionSegment[];
+  prefixLength: number;
   pickupStart: number;
   pickupEnd: number;
   dropoffStart: number;
@@ -746,6 +975,8 @@ function serviceTemplate(
     ALIGHT_SECONDS,
   );
   const dropoffEnd = cursor;
+  // Everything up to here is the same whichever berth the Pod parks at.
+  const prefixLength = segments.length;
   if (finalBerth.id !== dropoff.id) {
     appendTravel(
       world,
@@ -756,7 +987,14 @@ function serviceTemplate(
       laneProfile,
     );
   }
-  return { segments, pickupStart, pickupEnd, dropoffStart, dropoffEnd };
+  return {
+    segments,
+    prefixLength,
+    pickupStart,
+    pickupEnd,
+    dropoffStart,
+    dropoffEnd,
+  };
 }
 
 /**
@@ -836,9 +1074,9 @@ function computeService(
     return { ok: false, reason: "platform-busy" };
   }
 
-  const emptyPath = route(world, origin, actualPickup);
-  const loadedPath = route(world, actualPickup, actualDropoff);
-  if (!pathIsUsable(emptyPath) || !pathIsUsable(loadedPath)) {
+  const emptyRoutes = routeOptions(world, origin, actualPickup);
+  const loadedRoutes = routeOptions(world, actualPickup, actualDropoff);
+  if (!emptyRoutes.length || !loadedRoutes.length) {
     return { ok: false, reason: "disconnected" };
   }
 
@@ -861,63 +1099,165 @@ function computeService(
     | {
         terminal: TerminalCandidate;
         template: ReturnType<typeof serviceTemplate>;
-        scheduled: NonNullable<ReturnType<typeof searchDeparture>>;
+        scheduled: Departure;
         laneProfile: number;
+        variant: number;
       }
     | undefined;
   const calendars = blockedResources(world, pod.id);
-  for (const terminal of terminals) {
-    if (!pathIsUsable(terminal.relocationPath)) continue;
-    const seenProfiles = new Set<string>();
-    for (const laneProfile of [0, 1, 2]) {
-      const template = serviceTemplate(
-        world,
-        emptyPath,
-        loadedPath,
-        terminal.relocationPath,
-        actualPickup,
-        actualDropoff,
-        terminal.berth,
-        laneProfile,
-      );
-      const signature = template.segments
-        .filter((segment) => segment.kind === "move")
-        .map((segment) => segment.resources.join("|"))
-        .join(";");
-      if (seenProfiles.has(signature)) continue;
-      seenProfiles.add(signature);
-      const scheduled = searchDeparture(
-        world,
-        pod,
-        origin,
-        terminal.berth,
-        template.segments,
-        calendars,
-      );
-      if (!scheduled) continue;
-      const arrival = template.dropoffEnd + scheduled.departure;
-      const bestArrival = best
-        ? best.template.dropoffEnd + best.scheduled.departure
-        : Number.POSITIVE_INFINITY;
-      const end = scheduled.segments.at(-1)!.end;
-      const bestEnd =
-        best?.scheduled.segments.at(-1)!.end ?? Number.POSITIVE_INFINITY;
+  const variants = routeVariants(emptyRoutes, loadedRoutes);
+  const blockers = new Set<string>();
+  for (let variant = 0; variant < variants.length; variant += 1) {
+    const { emptyPath, loadedPath, diverted } = variants[variant];
+    // Going the long way only ever helps by missing something. Nothing stood in
+    // the shortest route's way, or the rerouted leg would meet all of it
+    // anyway: either way there is no point searching it, and the shortest route
+    // keeps the exact cost it had before detours existed. Only the leg that
+    // changed is weighed — the one that did not is travelled at another time,
+    // and its own crowding is not this detour's to answer for.
+    if (variant > 0) {
+      if (!blockers.size) break;
+      if (!relieves(blockers, routeFootprint(world, [diverted]))) continue;
+    }
+    // The soonest a detour could ever deliver is by leaving this instant and
+    // never stopping. Where even that loses to the incumbent, nothing inside
+    // this variant can win, and the whole terminal-by-lane search is skipped —
+    // so an uncontested shortest route costs exactly what it always did.
+    if (best) {
+      const earliest =
+        world.time +
+        travelSeconds(emptyPath) +
+        BOARD_SECONDS +
+        travelSeconds(loadedPath) +
+        ALIGHT_SECONDS;
+      const incumbent = best.template.dropoffEnd + best.scheduled.departure;
+      if (earliest >= incumbent - EPSILON) continue;
+    }
+    // One opening per lane profile, shared by every terminal that follows.
+    const openings: (RelativeReservation[] | undefined)[] = [];
+    const floors: (number | null)[] = [];
+    // A floor bounds nothing until every lane profile has one, and they are all
+    // worked out while the first terminal is priced — so from the second on.
+    let floor: number | null = null;
+    // Where to park is a question about the tail, and a detour changes the run
+    // before it. Once a berth has won that question outright, a rerouted run is
+    // measured against it there rather than reopening all of them; where the
+    // shortest route found no plan at all, the whole list is still in play.
+    const scope = variant === 0 || !best ? terminals : [best.terminal];
+    for (let index = 0; index < scope.length; index += 1) {
+      const terminal = scope[index];
+      if (!pathIsUsable(terminal.relocationPath)) continue;
+      const seenProfiles = new Set<string>();
+      for (const laneProfile of [0, 1, 2]) {
+        const template = serviceTemplate(
+          world,
+          emptyPath,
+          loadedPath,
+          terminal.relocationPath,
+          actualPickup,
+          actualDropoff,
+          terminal.berth,
+          laneProfile,
+        );
+        // Openings are settled before a repeated lane profile is dropped: what
+        // a lane profile owes up to the drop-off is the same whichever terminal
+        // asked for it, and a floor is only a floor once they all have one.
+        let opening = openings[laneProfile];
+        if (!opening) {
+          opening = mergeTrajectoryWindows(
+            trajectoryWindowRange(
+              world,
+              template.segments.slice(0, template.prefixLength),
+              0,
+              template.prefixLength,
+              1,
+            ),
+          );
+          openings[laneProfile] = opening;
+          floors[laneProfile] = openingFloor(world, opening, calendars);
+        }
+        const signature = template.segments
+          .filter((segment) => segment.kind === "move")
+          .map((segment) => segment.resources.join("|"))
+          .join(";");
+        if (seenProfiles.has(signature)) continue;
+        seenProfiles.add(signature);
+        const scheduled = searchDeparture(
+          world,
+          pod,
+          origin,
+          terminal.berth,
+          template.segments,
+          calendars,
+          opening,
+          template.prefixLength,
+          variant === 0 ? blockers : undefined,
+        );
+        if (!scheduled) continue;
+        const arrival = template.dropoffEnd + scheduled.departure;
+        const bestArrival = best
+          ? best.template.dropoffEnd + best.scheduled.departure
+          : Number.POSITIVE_INFINITY;
+        const end = departureEnd(template.segments, scheduled);
+        const bestEnd = best
+          ? departureEnd(best.template.segments, best.scheduled)
+          : Number.POSITIVE_INFINITY;
+        // Within one route, leaving earliest is leaving best: every candidate
+        // covers the same ground, so the ranking is the one it always was.
+        // Between routes it cannot be — a detour that leaves now to arrive late
+        // helps nobody — so those are judged on when the passenger gets out,
+        // and a tie leaves the shorter route in place.
+        const improves = !best
+          ? true
+          : best.variant !== variant
+            ? arrival < bestArrival - EPSILON ||
+              (Math.abs(arrival - bestArrival) <= EPSILON &&
+                end < bestEnd - EPSILON)
+            : scheduled.departure < best.scheduled.departure - EPSILON ||
+              (Math.abs(scheduled.departure - best.scheduled.departure) <=
+                EPSILON &&
+                (arrival < bestArrival - EPSILON ||
+                  (Math.abs(arrival - bestArrival) <= EPSILON &&
+                    (end < bestEnd - EPSILON ||
+                      (Math.abs(end - bestEnd) <= EPSILON &&
+                        laneProfile < best.laneProfile)))));
+        if (improves) {
+          best = { terminal, template, scheduled, laneProfile, variant };
+        }
+      }
       if (
-        !best ||
-        scheduled.departure < best.scheduled.departure - EPSILON ||
-        (Math.abs(scheduled.departure - best.scheduled.departure) <= EPSILON &&
-          (arrival < bestArrival - EPSILON ||
-            (Math.abs(arrival - bestArrival) <= EPSILON &&
-              (end < bestEnd - EPSILON ||
-                (Math.abs(end - bestEnd) <= EPSILON &&
-                  laneProfile < best.laneProfile)))))
+        floor === null &&
+        floors.length === 3 &&
+        floors.every((f) => f !== null)
+      )
+        floor = Math.min(...(floors as number[]));
+      // Nothing can leave before the opening every terminal shares has cleared,
+      // so a terminal that leaves exactly then cannot be beaten to the drop-off
+      // — and the list runs from the nearest parking berth outwards, so nothing
+      // behind it finishes sooner either. Berths the same distance out are
+      // still priced: those can finish level and win on the lane they take.
+      const held = best?.terminal.relocationPath;
+      if (
+        floor !== null &&
+        best &&
+        held &&
+        best.variant === variant &&
+        best.scheduled.departure <= floor + EPSILON
       ) {
-        best = { terminal, template, scheduled, laneProfile };
+        const next = scope[index + 1]?.relocationPath;
+        if (!next || pathLength(next) > pathLength(held) + EPSILON) break;
       }
     }
   }
   if (!best) return { ok: false, reason: "track-busy" };
   const { departure } = best.scheduled;
+  const committed = commitDeparture(
+    world,
+    pod,
+    origin,
+    best.template.segments,
+    best.scheduled,
+  );
   return {
     ok: true,
     originBerthId: origin.id,
@@ -929,9 +1269,9 @@ function computeService(
     pickupEnd: best.template.pickupEnd + departure,
     dropoffStart: best.template.dropoffStart + departure,
     dropoffEnd: best.template.dropoffEnd + departure,
-    end: best.scheduled.segments.at(-1)!.end,
-    segments: best.scheduled.segments,
-    reservations: best.scheduled.reservations,
+    end: committed.segments.at(-1)!.end,
+    segments: committed.segments,
+    reservations: committed.reservations,
   };
 }
 
@@ -954,57 +1294,92 @@ export function planRelocation(
         actualTarget.kind === "platform" ? "platform-busy" : "parking-full",
     };
   }
-  const relocationPath = route(world, origin, actualTarget);
-  if (!pathIsUsable(relocationPath))
-    return { ok: false, reason: "disconnected" };
+  const relocationRoutes = routeOptions(world, origin, actualTarget);
+  if (!relocationRoutes.length) return { ok: false, reason: "disconnected" };
 
-  let scheduled: ReturnType<typeof searchDeparture> = null;
+  let scheduled: Departure | null = null;
+  let bestTemplate: MotionSegment[] = [];
+  let bestVariant = -1;
   const calendars = blockedResources(world, pod.id);
-  const seenProfiles = new Set<string>();
-  for (const laneProfile of [0, 1, 2]) {
-    const template: MotionSegment[] = [];
-    appendTravel(world, template, relocationPath, "relocate", 0, laneProfile);
-    // Preserve the existing no-op relocation contract without putting fixed
-    // dwell segments into any route that actually travels.
-    if (!template.length) {
-      appendSegment(
-        template,
-        {
-          from: origin.point,
-          to: origin.point,
-          kind: "node",
-          stage: "relocate",
-          resources: [nodeKey(origin.point), berthResource(origin.id)],
-        },
-        0,
-        NODE_SECONDS,
-      );
+  const blockers = new Set<string>();
+  for (let variant = 0; variant < relocationRoutes.length; variant += 1) {
+    const relocationPath = relocationRoutes[variant];
+    if (variant > 0) {
+      if (!blockers.size) break;
+      if (!relieves(blockers, routeFootprint(world, [relocationPath])))
+        continue;
     }
-    const signature = template
-      .map((segment) => segment.resources.join("|"))
-      .join(";");
-    if (seenProfiles.has(signature)) continue;
-    seenProfiles.add(signature);
-    const candidate = searchDeparture(
-      world,
-      pod,
-      origin,
-      actualTarget,
-      template,
-      calendars,
-    );
-    if (
-      candidate &&
-      (!scheduled ||
-        candidate.departure < scheduled.departure - EPSILON ||
-        (Math.abs(candidate.departure - scheduled.departure) <= EPSILON &&
-          candidate.segments.at(-1)!.end <
-            scheduled.segments.at(-1)!.end - EPSILON))
-    ) {
-      scheduled = candidate;
+    // As in a service plan, a longer way round is only searched while it could
+    // still finish first.
+    if (scheduled) {
+      const earliest = world.time + travelSeconds(relocationPath);
+      if (earliest >= departureEnd(bestTemplate, scheduled) - EPSILON) continue;
+    }
+    const seenProfiles = new Set<string>();
+    for (const laneProfile of [0, 1, 2]) {
+      const template: MotionSegment[] = [];
+      appendTravel(world, template, relocationPath, "relocate", 0, laneProfile);
+      // Preserve the existing no-op relocation contract without putting fixed
+      // dwell segments into any route that actually travels.
+      if (!template.length) {
+        appendSegment(
+          template,
+          {
+            from: origin.point,
+            to: origin.point,
+            kind: "node",
+            stage: "relocate",
+            resources: [nodeKey(origin.point), berthResource(origin.id)],
+          },
+          0,
+          NODE_SECONDS,
+        );
+      }
+      const signature = template
+        .map((segment) => segment.resources.join("|"))
+        .join(";");
+      if (seenProfiles.has(signature)) continue;
+      seenProfiles.add(signature);
+      const candidate = searchDeparture(
+        world,
+        pod,
+        origin,
+        actualTarget,
+        template,
+        calendars,
+        [],
+        0,
+        variant === 0 ? blockers : undefined,
+      );
+      if (!candidate) continue;
+      // An empty move is judged by when it clears: within one route that is the
+      // earliest departure, between routes it is the earliest arrival.
+      const end = departureEnd(template, candidate);
+      const bestEnd = scheduled
+        ? departureEnd(bestTemplate, scheduled)
+        : Number.POSITIVE_INFINITY;
+      const improves = !scheduled
+        ? true
+        : bestVariant !== variant
+          ? end < bestEnd - EPSILON
+          : candidate.departure < scheduled.departure - EPSILON ||
+            (Math.abs(candidate.departure - scheduled.departure) <= EPSILON &&
+              end < bestEnd - EPSILON);
+      if (improves) {
+        scheduled = candidate;
+        bestTemplate = template;
+        bestVariant = variant;
+      }
     }
   }
   if (!scheduled) return { ok: false, reason: "track-busy" };
+  const committed = commitDeparture(
+    world,
+    pod,
+    origin,
+    bestTemplate,
+    scheduled,
+  );
   const plan: ServicePlan = {
     id: `relocate:${pod.id}:${actualTarget.id}:${world.time}`,
     podId: pod.id,
@@ -1013,10 +1388,10 @@ export function planRelocation(
     finalBerthId: actualTarget.id,
     requestedAt: world.time,
     departure: scheduled.departure,
-    end: scheduled.segments[scheduled.segments.length - 1].end,
+    end: committed.segments[committed.segments.length - 1].end,
     safetyBuffer: 1,
-    segments: scheduled.segments,
-    reservations: scheduled.reservations,
+    segments: committed.segments,
+    reservations: committed.reservations,
   };
   return { ok: true, plan };
 }

@@ -101,7 +101,7 @@ function pointWindows(world: World, point: MotionSegment["from"]): string[] {
  * share a resource, so the collator runs once per distinct resource instead of
  * once per comparison in a sort over every window.
  */
-function mergeWindows(
+export function mergeTrajectoryWindows(
   windows: TrajectoryReservationWindow[],
 ): TrajectoryReservationWindow[] {
   const groups = new Map<string, TrajectoryReservationWindow[]>();
@@ -134,6 +134,75 @@ function mergeWindows(
 }
 
 /**
+ * Two already-merged lists combined without sorting either of them again.
+ *
+ * Both sides come out of `mergeTrajectoryWindows`, so each is already in
+ * resource order with ascending, disjoint windows inside a resource. Walking
+ * the two together visits the union in exactly the order a fresh sort would,
+ * which makes the fold below produce exactly what merging from scratch does.
+ *
+ * Windows are handed on by reference rather than copied: a shared opening is
+ * merged against a different tail hundreds of times over, and almost none of
+ * its windows meet that tail. Only the one window a tail actually extends is
+ * copied, and only at the moment it would otherwise be written through.
+ * Everything a merge returns is therefore read-only to its caller.
+ */
+export function mergeSortedTrajectoryWindows(
+  left: TrajectoryReservationWindow[],
+  right: TrajectoryReservationWindow[],
+): TrajectoryReservationWindow[] {
+  if (!left.length) return right;
+  if (!right.length) return left;
+  const merged: TrajectoryReservationWindow[] = [];
+  let l = 0;
+  let r = 0;
+  // Ranks are read once per window rather than once per comparison; each side
+  // only moves on after it has been taken.
+  let leftRank = resourceRanks.get(left[0].resource)!;
+  let rightRank = resourceRanks.get(right[0].resource)!;
+  let owned = false;
+  while (l < left.length || r < right.length) {
+    let next: TrajectoryReservationWindow;
+    if (r === right.length || (l < left.length && takeLeft())) {
+      next = left[l];
+      l += 1;
+      if (l < left.length) leftRank = resourceRanks.get(left[l].resource)!;
+    } else {
+      next = right[r];
+      r += 1;
+      if (r < right.length) rightRank = resourceRanks.get(right[r].resource)!;
+    }
+    let previous = merged[merged.length - 1];
+    if (
+      previous &&
+      previous.resource === next.resource &&
+      next.start <= previous.end + EPSILON
+    ) {
+      if (next.end > previous.end) {
+        if (!owned) {
+          previous = { ...previous };
+          merged[merged.length - 1] = previous;
+          owned = true;
+        }
+        previous.end = next.end;
+      }
+    } else {
+      merged.push(next);
+      owned = false;
+    }
+  }
+  return merged;
+
+  // Equal ranks are the same resource, so the tie falls to the window itself.
+  function takeLeft(): boolean {
+    if (leftRank !== rightRank) return leftRank < rightRank;
+    const a = left[l];
+    const b = right[r];
+    return a.start !== b.start ? a.start < b.start : a.end <= b.end;
+  }
+}
+
+/**
  * Rebuild every physical reservation from geometry and time, never from the
  * resource arrays supplied by a planner or save file.
  *
@@ -144,6 +213,26 @@ function mergeWindows(
 export function requiredTrajectoryWindows(
   world: World,
   segments: MotionSegment[],
+  safetyBuffer: 0 | 1 = 1,
+): TrajectoryReservationWindow[] {
+  return mergeTrajectoryWindows(
+    trajectoryWindowRange(world, segments, 0, segments.length, safetyBuffer),
+  );
+}
+
+/**
+ * The unmerged windows owed by one stretch of a trajectory.
+ *
+ * A segment's windows read no further than its immediate neighbours, so a
+ * stretch can be derived on its own as long as it is handed the whole list to
+ * look them up in. That is what lets a planner work out the shared part of many
+ * candidate plans once instead of once per candidate.
+ */
+export function trajectoryWindowRange(
+  world: World,
+  segments: MotionSegment[],
+  first: number,
+  last: number,
   safetyBuffer: 0 | 1 = 1,
 ): TrajectoryReservationWindow[] {
   const windows: TrajectoryReservationWindow[] = [];
@@ -178,7 +267,8 @@ export function requiredTrajectoryWindows(
   const resourcesOf = (index: number): string[] => resolve(index).resources;
   const laneOf = (index: number): number | null => resolve(index).lane;
 
-  for (const [index, segment] of segments.entries()) {
+  for (let index = first; index < last; index += 1) {
+    const segment = segments[index];
     if (segment.kind === "move") {
       add(resourcesOf(index), segment.start, segment.end + CLEARANCE_SECONDS);
       if (safetyBuffer === 1) {
@@ -202,7 +292,7 @@ export function requiredTrajectoryWindows(
       }
 
       // A continuous trajectory has no preceding dwell at its first point.
-      if (index === 0) {
+      if (index === 0 && first === 0) {
         add(
           pointWindows(world, segment.from),
           segment.start,
@@ -243,7 +333,7 @@ export function requiredTrajectoryWindows(
     }
   }
 
-  return mergeWindows(windows);
+  return windows;
 }
 
 /** Reconstruct and validate a plan's physical requirements. */
